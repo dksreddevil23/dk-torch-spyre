@@ -2224,9 +2224,16 @@ _run_parallel_across_cards() {
             export OOT_TEST_FILE="$_rf"
             # Give this probe its own Inductor cache dir so concurrent collect-only imports can't race on the same shutil.rmtree() target (see the identical fix for the per-card execution subshells below).
             _probe_base_cache="${TORCHINDUCTOR_CACHE_DIR:-/tmp/torchinductor_${USER:-$(id -un)}}"
-            # Bucketed by the same concurrency bound as the probe throttle, not by file, so the directory count stays fixed instead of growing with the file list.
-            _probe_slot=$(( i % _n_cards ))
-            export TORCHINDUCTOR_CACHE_DIR="${_probe_base_cache}__collect_slot${_probe_slot}"
+            # Keyed by file index i (unique per file), not by slot (i % _n_cards).
+            # A slot-keyed dir is reused by the next probe scheduled into that
+            # slot as soon as the concurrency throttle admits it, racing that
+            # probe's cache import against the previous occupant's teardown
+            # rmtree() of the same directory -- Inductor-heavy files (e.g. the
+            # upstream_tests_beta inductor-* suites, which do real compilation
+            # work during collection) hit this often enough at _n_cards >= 2
+            # to come back with zero collected IDs. Matches the retry probe
+            # below, which already keys its own cache dir by file index.
+            export TORCHINDUCTOR_CACHE_DIR="${_probe_base_cache}__collect_${i}"
             cd "$_rd" && python3 -m pytest "$_rb" \
                 "${_collect_args[@]+"${_collect_args[@]}"}" \
                 --collect-only -q --no-header 2>"$_cerr" \
