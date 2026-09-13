@@ -14,10 +14,13 @@
 
 import copy
 import functools
+import gc
 import torch_spyre
 import os
 import sys
 import torch
+import torch._dynamo
+from torch._inductor.codecache import PyCodeCache
 from torch.utils import _pytree as pytree
 from torch.testing import FileCheck
 
@@ -25,6 +28,7 @@ from torch._dynamo.testing import make_test_cls_with_patches
 
 import unittest
 from utils_inductor import compare_with_cpu
+from torch_spyre._inductor.op_spec import clear_constant_tensor_cache
 
 _test_dir = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
 sys.path.append(_test_dir)
@@ -45,6 +49,38 @@ tests_lx_planning_run_skips: bool = (
 # wrap every generated test — useful for thorough triage, skip-list
 # maintenance, and CI but slow for everyday dev workflow.
 tests_lx_planning_full: bool = os.environ.get("TEST_LX_PLANNING_FULL", "1") == "1"
+
+
+def _reset_spyre_compile_state():
+    """Release every compiled kernel from this process's in-memory caches.
+
+    This file wraps essentially the entire TestOps catalog into two classes
+    and runs them all in one pytest process (run_test.sh invokes pytest once
+    per file, and configs sharing this file's path are merged), so with
+    TEST_LX_PLANNING_FULL=1 it compiles on the order of a thousand distinct
+    kernels (unique op/shape pairs, forced sencores=32). Each compiled kernel's
+    SpyreSDSCKernelRunner lazily allocates a JobPlan on first run (see
+    kernel_runner.py), which owns a permanent device allocation out of the
+    fixed 16 GiB Program-memory segment (constants.INTERMEDIATES_SEGMENT) --
+    freed only when the JobPlan C++ object is destroyed. Nothing destroys it
+    while PyCodeCache keeps the generated wrapper module (and the
+    SpyreSDSCKernelRunner it holds as a global) alive for the rest of the
+    process, so the segment fills up and every kernel compiled after that
+    fails with a FlexAllocator "All memory regions exhausted" error.
+
+    Clearing Dynamo's guard/bytecode cache and Inductor's compiled-module
+    cache drops the last strong reference to each finished test's compiled
+    kernels, letting their JobPlans (and Program-segment allocations) be
+    freed before the next test compiles new ones.
+    """
+    torch._dynamo.reset()
+    PyCodeCache.cache_clear()
+    clear_constant_tensor_cache()
+    # Two passes: the first breaks reference cycles and drops refcounts to
+    # zero, the second reclaims objects whose __del__ resurrected other
+    # unreachable objects during the first pass (see test_allocator_e2e.py).
+    gc.collect()
+    gc.collect()
 
 
 def make_lx_planning_class(cls):
@@ -177,6 +213,12 @@ class _LxPlanningTwoOpTestBase(unittest.TestCase):
     def setUp(self):
         super().setUp()
         torch.manual_seed(0xAFFE)
+
+    def tearDown(self):
+        try:
+            _reset_spyre_compile_state()
+        finally:
+            super().tearDown()
 
     def wrap(self, fn):
         raise NotImplementedError
