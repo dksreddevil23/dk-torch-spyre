@@ -2230,6 +2230,15 @@ _run_parallel_across_cards() {
             # address in /dev/vfio. See torch_spyre/__init__.py's
             # _OOT_COLLECT_ONLY.
             export OOT_COLLECT_ONLY=1
+            # get_all_devices() (oot_test_base_common.py) parametrizes tests
+            # over device_count() devices. With no SPYRE_DEVICES/AIU_WORLD_SIZE
+            # set, flex::getNumDevices() reports every physical Spyre card on
+            # the box instead of the single device each per-card execution
+            # subshell below actually exposes (SPYRE_DEVICES=<one id>), so
+            # collection over-parametrizes those tests regardless of how many
+            # cards this run requested. Pin it to 1 to match execution.
+            unset SPYRE_DEVICES
+            export AIU_WORLD_SIZE=1
             # Give this probe its own Inductor cache dir so concurrent collect-only imports can't race on the same shutil.rmtree() target (see the identical fix for the per-card execution subshells below).
             _probe_base_cache="${TORCHINDUCTOR_CACHE_DIR:-/tmp/torchinductor_${USER:-$(id -un)}}"
             # Keyed by file index i (unique per file), not by slot (i % _n_cards).
@@ -2289,6 +2298,9 @@ _run_parallel_across_cards() {
                     export OOT_TEST_FILE="$_rf2"
                     # Same reason as the main probe above -- see _OOT_COLLECT_ONLY in torch_spyre/__init__.py.
                     export OOT_COLLECT_ONLY=1
+                    # Same reason as the main probe above -- pin device_count() to 1.
+                    unset SPYRE_DEVICES
+                    export AIU_WORLD_SIZE=1
                     # A dedicated cache dir for the retry too, so it can't collide with whatever else is still running.
                     export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/tmp/torchinductor_${USER:-$(id -un)}}__retry_${i}"
                     cd "$(dirname "$_rf2")" && python3 -m pytest "$(basename "$_rf2")" \
