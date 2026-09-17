@@ -2228,10 +2228,10 @@ _run_parallel_across_cards() {
             # instead was tried and measurably slower (every probe pays a cold-cache setup
             # cost instead of most reusing an already-warmed slot's dir), without actually
             # preventing failures: the same handful of heavy-import files still failed on a
-            # contended first attempt even with fully unique dirs, and only the solo retry
-            # below (uncontended, not cache-dir isolation) reliably saved them. So slot bucketing
-            # stays naive here; a same-slot collision, if it ever happens, is caught by that
-            # retry instead of prevented up front.
+            # contended first attempt even with fully unique dirs, and it was the retry below
+            # (a fresh, less-contended attempt -- not cache-dir isolation) that reliably saved
+            # them. So slot bucketing stays naive here; a same-slot collision, if it ever
+            # happens, is caught by that retry instead of prevented up front.
             _probe_base_cache="${TORCHINDUCTOR_CACHE_DIR:-/tmp/torchinductor_${USER:-$(id -un)}}"
             _probe_slot=$(( i % _n_cards ))
             export TORCHINDUCTOR_CACHE_DIR="${_probe_base_cache}__collect_slot${_probe_slot}"
@@ -2257,11 +2257,6 @@ _run_parallel_across_cards() {
 
     # Read back each probe's output and figure out which files need a retry (signal-killed
     # or interrupted -- exit >=128 or exit 2, with empty stdout/stderr, same as before).
-    # Retries are deferred to the next block instead of run inline here so they can go out
-    # concurrently: with the primary wave now fully done, retrying strictly one-at-a-time
-    # stalls the whole collection phase for as long as it takes to solo-reimport every retry
-    # candidate in turn -- expensive, since retry candidates skew toward the handful of
-    # heavy-import files (e.g. test_inductor_ops.py) that are slow to reimport to begin with.
     declare -A _raw_ids_map=()
     declare -A _err_file_map=()
     local -a _retry_idx=()
@@ -2283,92 +2278,67 @@ _run_parallel_across_cards() {
         fi
     done
 
-    # Retry pass 1: run every candidate concurrently (bounded to _n_cards, same throttle as the
-    # primary probes above) instead of one at a time -- much faster in the common case. This
-    # does reintroduce concurrency among retry candidates, which is the opposite of the "alone"
-    # isolation the original serial retry relied on for reliability; pass 2 below is the safety
-    # net, still fully serial, for any file that still comes up empty after this parallel pass.
-    declare -A _retry_out_files=()
-    declare -A _retry_err_files=()
-    local -a _retry_pids=()
-    for i in "${_retry_idx[@]+"${_retry_idx[@]}"}"; do
-        echo "[torch_oot_device_tests_run_serial]   $(basename "${TEST_FILES[$i]}") collect-only was signal-killed or interrupted -- retrying." >&2
-        local _rf2="${RUN_FILES[$i]}"
-        local _rout="/tmp/_spyre_collect_retry_ids_${$}_${i}.tmp"
-        local _rerr="/tmp/_spyre_collect_retry_err_${$}_${i}.tmp"
-        _retry_out_files[$i]="$_rout"
-        _retry_err_files[$i]="$_rerr"
-        (
-            set +euo pipefail
-            export SPYRE_TEST_FILE="$_rf2"
-            export OOT_TEST_FILE="$_rf2"
-            # A dedicated cache dir for the retry too, so it can't collide with whatever else is still running.
-            export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/tmp/torchinductor_${USER:-$(id -un)}}__retry_${i}"
-            cd "$(dirname "$_rf2")" && python3 -m pytest "$(basename "$_rf2")" \
-                "${_collect_args[@]+"${_collect_args[@]}"}" \
-                --collect-only -q --no-header 2>"$_rerr" \
-            | grep '\.py::' > "$_rout"
-        ) &
-        _retry_pids+=($!)
-        while [[ "$(jobs -rp | wc -l)" -ge "$_n_cards" ]]; do
-            wait -n 2>/dev/null || true
+    # Retry every still-failing candidate concurrently (bounded to _n_cards, same throttle as
+    # the primary probes above), for up to _MAX_RETRY_ROUNDS rounds -- there is no serial,
+    # one-at-a-time retry path: every round, including the last, launches its whole candidate
+    # set at once. The candidate set only shrinks between rounds (a file drops out as soon as
+    # it succeeds or reports a real error), so later rounds cost less than the first, not more.
+    local _MAX_RETRY_ROUNDS=3
+    local _retry_round=0
+    while [[ ${#_retry_idx[@]} -gt 0 && $_retry_round -lt $_MAX_RETRY_ROUNDS ]]; do
+        _retry_round=$(( _retry_round + 1 ))
+        declare -A _retry_out_files=()
+        declare -A _retry_err_files=()
+        local -a _retry_pids=()
+        for i in "${_retry_idx[@]}"; do
+            echo "[torch_oot_device_tests_run_serial]   $(basename "${TEST_FILES[$i]}") collect-only was signal-killed or interrupted -- retrying (round ${_retry_round})." >&2
+            local _rf2="${RUN_FILES[$i]}"
+            local _rout="/tmp/_spyre_collect_retry_ids_${$}_${i}.tmp"
+            local _rerr="/tmp/_spyre_collect_retry_err_${$}_${i}.tmp"
+            _retry_out_files[$i]="$_rout"
+            _retry_err_files[$i]="$_rerr"
+            (
+                set +euo pipefail
+                export SPYRE_TEST_FILE="$_rf2"
+                export OOT_TEST_FILE="$_rf2"
+                # A dedicated cache dir for the retry too, so it can't collide with whatever else is still running.
+                export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/tmp/torchinductor_${USER:-$(id -un)}}__retry_${i}"
+                cd "$(dirname "$_rf2")" && python3 -m pytest "$(basename "$_rf2")" \
+                    "${_collect_args[@]+"${_collect_args[@]}"}" \
+                    --collect-only -q --no-header 2>"$_rerr" \
+                | grep '\.py::' > "$_rout"
+            ) &
+            _retry_pids+=($!)
+            while [[ "$(jobs -rp | wc -l)" -ge "$_n_cards" ]]; do
+                wait -n 2>/dev/null || true
+            done
         done
-    done
-    for _rpid in "${_retry_pids[@]+"${_retry_pids[@]}"}"; do
-        wait "$_rpid" 2>/dev/null || true
-    done
+        for _rpid in "${_retry_pids[@]+"${_retry_pids[@]}"}"; do
+            wait "$_rpid" 2>/dev/null || true
+        done
 
-    # Fold pass-1 results back in; anything still empty (stdout AND stderr) goes into a second,
-    # strictly serial pass below -- the same one-at-a-time, no-concurrent-siblings retry the
-    # original code always did, kept as the reliability floor for the rare straggler.
-    local -a _straggler_idx=()
-    for i in "${_retry_idx[@]+"${_retry_idx[@]}"}"; do
-        local _rout="${_retry_out_files[$i]}"
-        local _rerr="${_retry_err_files[$i]}"
-        local _raw_ids=""
-        [[ -f "$_rout" ]] && _raw_ids="$(< "$_rout")"
-        rm -f "$_rout"
-        if [[ -n "$_raw_ids" ]]; then
-            echo "[torch_oot_device_tests_run_serial]   retry succeeded for $(basename "${TEST_FILES[$i]}")." >&2
-            _raw_ids_map[$i]="$_raw_ids"
-            rm -f "$_rerr"
-        elif [[ -s "$_rerr" ]]; then
-            # The retry's own stderr is more relevant than the original (empty) one if it failed for a different reason.
-            _err_file_map[$i]="$_rerr"
-        else
-            _straggler_idx+=("$i")
-            rm -f "$_rerr"
-        fi
-    done
-
-    for i in "${_straggler_idx[@]+"${_straggler_idx[@]}"}"; do
-        local _of="${TEST_FILES[$i]}"
-        echo "[torch_oot_device_tests_run_serial]   $(basename "$_of") still had no test IDs after a concurrent retry -- retrying alone." >&2
-        local _rf2="${RUN_FILES[$i]}"
-        local _rout="/tmp/_spyre_collect_retry_ids_${$}_${i}.tmp"
-        local _rerr="/tmp/_spyre_collect_retry_err_${$}_${i}.tmp"
-        (
-            set +euo pipefail
-            export SPYRE_TEST_FILE="$_rf2"
-            export OOT_TEST_FILE="$_rf2"
-            export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/tmp/torchinductor_${USER:-$(id -un)}}__retry_${i}"
-            cd "$(dirname "$_rf2")" && python3 -m pytest "$(basename "$_rf2")" \
-                "${_collect_args[@]+"${_collect_args[@]}"}" \
-                --collect-only -q --no-header 2>"$_rerr" \
-            | grep '\.py::' > "$_rout"
-        )
-        local _raw_ids=""
-        [[ -f "$_rout" ]] && _raw_ids="$(< "$_rout")"
-        rm -f "$_rout"
-        if [[ -n "$_raw_ids" ]]; then
-            echo "[torch_oot_device_tests_run_serial]   solo retry succeeded for $(basename "$_of")." >&2
-            _raw_ids_map[$i]="$_raw_ids"
-            rm -f "$_rerr"
-        elif [[ -s "$_rerr" ]]; then
-            _err_file_map[$i]="$_rerr"
-        else
-            rm -f "$_rerr"
-        fi
+        # Fold this round's results back in; anything still empty (stdout AND stderr) carries
+        # over into the next round's candidate set instead of a separate serial fallback.
+        local -a _next_retry_idx=()
+        for i in "${_retry_idx[@]}"; do
+            local _rout="${_retry_out_files[$i]}"
+            local _rerr="${_retry_err_files[$i]}"
+            local _raw_ids=""
+            [[ -f "$_rout" ]] && _raw_ids="$(< "$_rout")"
+            rm -f "$_rout"
+            if [[ -n "$_raw_ids" ]]; then
+                echo "[torch_oot_device_tests_run_serial]   retry succeeded for $(basename "${TEST_FILES[$i]}") (round ${_retry_round})." >&2
+                _raw_ids_map[$i]="$_raw_ids"
+                rm -f "$_rerr"
+            elif [[ -s "$_rerr" ]]; then
+                # The retry's own stderr is more relevant than the original (empty) one if it failed for a different reason.
+                _err_file_map[$i]="$_rerr"
+            else
+                _next_retry_idx+=("$i")
+                rm -f "$_rerr"
+            fi
+        done
+        _retry_idx=("${_next_retry_idx[@]+"${_next_retry_idx[@]}"}")
     done
 
     # Finalize in file order, preserving the exact ordering the original serial loop produced.
@@ -2393,7 +2363,7 @@ _run_parallel_across_cards() {
                 if [[ "$_pexit" =~ ^[0-9]+$ && "$_pexit" -ge 128 ]]; then
                     echo "[torch_oot_device_tests_run_serial]   collect-only produced no stderr either -- python3 exited with code ${_pexit} (signal $(( _pexit - 128 )), likely OOM-killed if that's SIGKILL/9)." >&2
                 elif [[ "$_pexit" == "2" ]]; then
-                    echo "[torch_oot_device_tests_run_serial]   collect-only produced no stderr either -- python3 exit code: 2 (pytest: collection interrupted, e.g. an import/collection error), even after a solo retry." >&2
+                    echo "[torch_oot_device_tests_run_serial]   collect-only produced no stderr either -- python3 exit code: 2 (pytest: collection interrupted, e.g. an import/collection error), even after ${_MAX_RETRY_ROUNDS} retry round(s)." >&2
                 else
                     echo "[torch_oot_device_tests_run_serial]   collect-only produced no stderr either -- python3 exit code: ${_pexit:-unknown}." >&2
                 fi
