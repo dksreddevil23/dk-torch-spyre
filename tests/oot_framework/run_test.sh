@@ -2206,6 +2206,12 @@ _run_parallel_across_cards() {
     local -a _collect_err_files=()
     # Parallel array holding each probe's own exit code, to catch a signal kill (e.g. OOM) even when stdout/stderr are both empty.
     local -a _collect_exit_files=()
+    # Parallel array holding each probe's *unfiltered* stdout (before the `grep '.py::'` below
+    # discards anything that isn't a node ID). A collection error (e.g. exit 2) commonly prints
+    # its explanation as a pytest summary line that never matches that grep, so without this the
+    # explanation is silently thrown away -- especially costly for a failure that self-resolves
+    # on retry, since the stderr/exit-code diagnostics below never get a chance to fire at all.
+    local -a _collect_raw_files=()
     local -a _collect_pids=()
     # At most one heavy-file probe is ever in flight at a time (see
     # _HEAVY_COLLECT_BASENAMES above): a heavy launch first waits on whichever
@@ -2229,6 +2235,9 @@ _run_parallel_across_cards() {
         # Same index-alignment reasoning as _collect_out_files above.
         local _cexit="/tmp/_spyre_collect_exit_${$}_${i}.tmp"
         _collect_exit_files[$i]="$_cexit"
+        # Same index-alignment reasoning as _collect_out_files above.
+        local _craw="/tmp/_spyre_collect_raw_${$}_${i}.tmp"
+        _collect_raw_files[$i]="$_craw"
 
         echo "[torch_oot_device_tests_run]   collecting: $(basename "${TEST_FILES[$i]}")"
 
@@ -2263,8 +2272,9 @@ _run_parallel_across_cards() {
             cd "$_rd" && python3 -m pytest "$_rb" \
                 "${_collect_args[@]+"${_collect_args[@]}"}" \
                 --collect-only -q --no-header 2>"$_cerr" \
+            | tee "$_craw" \
             | grep '\.py::' > "$_cout"
-            # python3's own exit code (PIPESTATUS[0], not grep's), so a signal kill shows up even with empty stdout/stderr.
+            # python3's own exit code (PIPESTATUS[0], not grep's or tee's), so a signal kill shows up even with empty stdout/stderr.
             echo "${PIPESTATUS[0]}" > "$_cexit"
         ) &
         _collect_pids+=($!)
@@ -2289,11 +2299,17 @@ _run_parallel_across_cards() {
     # updated as retry rounds run so the finalize step below can report the *last* attempt's
     # exit code instead of always the first one.
     declare -A _exit_map=()
+    # Unfiltered stdout of the most recent failing attempt for a file still being retried --
+    # see _collect_raw_files above for why this is captured at all. Lifecycle mirrors _exit_map:
+    # set here or in a retry round's fold-back below, printed alongside the next round's
+    # "retrying" announcement, then refreshed or cleared every round after that.
+    declare -A _raw_out_map=()
     local -a _retry_idx=()
     for i in "${_target_idx[@]}"; do
         local _cout="${_collect_out_files[$i]}"
         local _cerr="${_collect_err_files[$i]}"
         local _cexit="${_collect_exit_files[$i]}"
+        local _craw="${_collect_raw_files[$i]}"
 
         local _raw_ids=""
         [[ -f "$_cout" ]] && _raw_ids="$(< "$_cout")"
@@ -2305,8 +2321,10 @@ _run_parallel_across_cards() {
             local _pexit=""
             [[ -f "$_cexit" ]] && _pexit="$(< "$_cexit")"
             _exit_map[$i]="$_pexit"
+            [[ -s "$_craw" ]] && _raw_out_map[$i]="$(< "$_craw")"
             [[ "$_pexit" =~ ^[0-9]+$ && ( "$_pexit" -ge 128 || "$_pexit" -eq 2 ) ]] && _retry_idx+=("$i")
         fi
+        rm -f "$_craw"
     done
 
     # Retry every still-failing candidate concurrently (bounded to _n_cards, same throttle as
@@ -2325,19 +2343,30 @@ _run_parallel_across_cards() {
         declare -A _retry_out_files=()
         declare -A _retry_err_files=()
         declare -A _retry_exit_files=()
+        declare -A _retry_raw_files=()
         local -a _retry_pids=()
         # Reset per round: same heavy-lane isolation as the primary probe
         # fan-out above, layered on the existing _n_cards throttle.
         local _active_heavy_pid=""
         for i in "${_retry_idx[@]}"; do
             echo "[torch_oot_device_tests_run_serial]   $(basename "${TEST_FILES[$i]}") collect-only was signal-killed or interrupted (exit ${_exit_map[$i]:-unknown}) -- retrying (round ${_retry_round})." >&2
+            # Surface whatever the failed attempt actually printed (see _raw_out_map above) --
+            # without this, a failure that clears up by the next round leaves no trace at all of
+            # why it happened, since the finalize diagnostics below never run for it.
+            if [[ -n "${_raw_out_map[$i]:-}" ]]; then
+                echo "[torch_oot_device_tests_run_serial]   ----- collect-only stdout (unfiltered) for $(basename "${TEST_FILES[$i]}") -----" >&2
+                printf '%s\n' "${_raw_out_map[$i]}" | sed 's/^/[torch_oot_device_tests_run_serial]   /' >&2
+                echo "[torch_oot_device_tests_run_serial]   ----- end stdout -----" >&2
+            fi
             local _rf2="${RUN_FILES[$i]}"
             local _rout="/tmp/_spyre_collect_retry_ids_${$}_${i}.tmp"
             local _rerr="/tmp/_spyre_collect_retry_err_${$}_${i}.tmp"
             local _rexit="/tmp/_spyre_collect_retry_exit_${$}_${i}.tmp"
+            local _rraw="/tmp/_spyre_collect_retry_raw_${$}_${i}.tmp"
             _retry_out_files[$i]="$_rout"
             _retry_err_files[$i]="$_rerr"
             _retry_exit_files[$i]="$_rexit"
+            _retry_raw_files[$i]="$_rraw"
 
             local _is_heavy=0 _hb
             for _hb in "${_HEAVY_COLLECT_BASENAMES[@]}"; do
@@ -2356,6 +2385,7 @@ _run_parallel_across_cards() {
                 cd "$(dirname "$_rf2")" && python3 -m pytest "$(basename "$_rf2")" \
                     "${_collect_args[@]+"${_collect_args[@]}"}" \
                     --collect-only -q --no-header 2>"$_rerr" \
+                | tee "$_rraw" \
                 | grep '\.py::' > "$_rout"
                 # Same PIPESTATUS[0] capture as the primary probe above, so a later round's own
                 # exit code is available for the finalize diagnostic below.
@@ -2378,26 +2408,37 @@ _run_parallel_across_cards() {
             local _rout="${_retry_out_files[$i]}"
             local _rerr="${_retry_err_files[$i]}"
             local _rexit="${_retry_exit_files[$i]}"
+            local _rraw="${_retry_raw_files[$i]}"
             local _raw_ids=""
             [[ -f "$_rout" ]] && _raw_ids="$(< "$_rout")"
             rm -f "$_rout"
             if [[ -n "$_raw_ids" ]]; then
                 echo "[torch_oot_device_tests_run_serial]   retry succeeded for $(basename "${TEST_FILES[$i]}") (round ${_retry_round})." >&2
                 _raw_ids_map[$i]="$_raw_ids"
-                rm -f "$_rerr" "$_rexit"
+                unset "_raw_out_map[$i]"
+                rm -f "$_rerr" "$_rexit" "$_rraw"
             elif [[ -s "$_rerr" ]]; then
                 # The retry's own stderr is more relevant than the original (empty) one if it failed for a different reason.
                 _err_file_map[$i]="$_rerr"
-                rm -f "$_rexit"
+                unset "_raw_out_map[$i]"
+                rm -f "$_rexit" "$_rraw"
             else
                 # Still empty stdout/stderr -- record this round's own exit code so the next
                 # round's log line, or the finalize diagnostic if rounds run out, reports the
-                # attempt that actually produced it rather than the first attempt's.
+                # attempt that actually produced it rather than the first attempt's. Same for
+                # the raw stdout dump: refresh it to this round's (or clear it if this round's
+                # probe never got to print anything either) so a later round never reprints a
+                # stale attempt's output as if it were current.
                 local _rpexit=""
                 [[ -f "$_rexit" ]] && _rpexit="$(< "$_rexit")"
                 _exit_map[$i]="$_rpexit"
+                if [[ -s "$_rraw" ]]; then
+                    _raw_out_map[$i]="$(< "$_rraw")"
+                else
+                    unset "_raw_out_map[$i]"
+                fi
                 _next_retry_idx+=("$i")
-                rm -f "$_rerr" "$_rexit"
+                rm -f "$_rerr" "$_rexit" "$_rraw"
             fi
         done
         _retry_idx=("${_next_retry_idx[@]+"${_next_retry_idx[@]}"}")
@@ -2431,6 +2472,14 @@ _run_parallel_across_cards() {
                     echo "[torch_oot_device_tests_run_serial]   collect-only produced no stderr either -- python3 exit code: 2 (pytest: collection interrupted, e.g. an import/collection error), even after ${_MAX_RETRY_ROUNDS} retry round(s)." >&2
                 else
                     echo "[torch_oot_device_tests_run_serial]   collect-only produced no stderr either -- python3 exit code: ${_pexit:-unknown}." >&2
+                fi
+                # The last attempt's unfiltered stdout (see _raw_out_map above) -- often the only
+                # surviving record of *why*, since a collection error commonly prints its
+                # explanation to stdout as a summary line that the node-ID grep discards.
+                if [[ -n "${_raw_out_map[$i]:-}" ]]; then
+                    echo "[torch_oot_device_tests_run_serial]   ----- collect-only stdout (unfiltered) for $(basename "$_of") -----" >&2
+                    printf '%s\n' "${_raw_out_map[$i]}" | sed 's/^/[torch_oot_device_tests_run_serial]   /' >&2
+                    echo "[torch_oot_device_tests_run_serial]   ----- end stdout -----" >&2
                 fi
             fi
             rm -f "$_cerr" "$_cexit"
