@@ -2126,6 +2126,14 @@ except Exception as e:
 # ---------------------------------------------------------------------------
 _run_parallel_across_cards() {
     local _n_cards="$1"
+    # Files with a known-heavy import (torch.compile / large stickified
+    # tensors) whose concurrent collect-only imports have caused OOM
+    # signal-kills / exit 2 when they land in the same probe batch as each
+    # other (see fb265ed). Matched against TEST_FILES basenames -- not
+    # RUN_FILES, which may point at a generated __oot_wrapper.py.
+    local -a _HEAVY_COLLECT_BASENAMES=(
+        "test_inductor_ops.py" "test_restickify.py" "test_tensor_layout.py"
+    )
     # The caller now passes only the RUN_FILES indices eligible for round-robin (distributed tests are excluded, see below).
     shift
     local -a _target_idx=("$@")
@@ -2199,6 +2207,13 @@ _run_parallel_across_cards() {
     # Parallel array holding each probe's own exit code, to catch a signal kill (e.g. OOM) even when stdout/stderr are both empty.
     local -a _collect_exit_files=()
     local -a _collect_pids=()
+    # At most one heavy-file probe is ever in flight at a time (see
+    # _HEAVY_COLLECT_BASENAMES above): a heavy launch first waits on whichever
+    # heavy probe is still running, so the known-heavy files can no longer
+    # collide with *each other* for memory. This is layered on top of, not a
+    # replacement for, the _n_cards throttle below -- heavy and light probes
+    # can still run alongside each other up to that combined cap.
+    local _active_heavy_pid=""
     # Only walk the non-distributed subset handed in by the caller, not every resolved file.
     for i in "${_target_idx[@]}"; do
         local _rf="${RUN_FILES[$i]}"
@@ -2216,6 +2231,16 @@ _run_parallel_across_cards() {
         _collect_exit_files[$i]="$_cexit"
 
         echo "[torch_oot_device_tests_run]   collecting: $(basename "${TEST_FILES[$i]}")"
+
+        # Classify against TEST_FILES (the original name), not RUN_FILES
+        # (which may be a generated __oot_wrapper.py).
+        local _is_heavy=0 _hb
+        for _hb in "${_HEAVY_COLLECT_BASENAMES[@]}"; do
+            [[ "$(basename "${TEST_FILES[$i]}")" == "$_hb" ]] && { _is_heavy=1; break; }
+        done
+        if [[ $_is_heavy -eq 1 && -n "$_active_heavy_pid" ]]; then
+            wait "$_active_heavy_pid" 2>/dev/null || true
+        fi
 
         (
             # A 0-match --collect-only (or a killed probe) is expected/handled below, not a script-ending error.
@@ -2243,6 +2268,7 @@ _run_parallel_across_cards() {
             echo "${PIPESTATUS[0]}" > "$_cexit"
         ) &
         _collect_pids+=($!)
+        [[ $_is_heavy -eq 1 ]] && _active_heavy_pid=$!
 
         # Throttle to at most _n_cards concurrent probes.
         while [[ "$(jobs -rp | wc -l)" -ge "$_n_cards" ]]; do
@@ -2288,6 +2314,10 @@ _run_parallel_across_cards() {
     # one-at-a-time retry path: every round, including the last, launches its whole candidate
     # set at once. The candidate set only shrinks between rounds (a file drops out as soon as
     # it succeeds or reports a real error), so later rounds cost less than the first, not more.
+    # This remains a safety net for genuinely transient failures (or files outside
+    # _HEAVY_COLLECT_BASENAMES) -- with the heavy-file lane above preventing the known
+    # heavy imports from colliding with each other during the primary pass, those three
+    # files should rarely land here at all now.
     local _MAX_RETRY_ROUNDS=3
     local _retry_round=0
     while [[ ${#_retry_idx[@]} -gt 0 && $_retry_round -lt $_MAX_RETRY_ROUNDS ]]; do
@@ -2296,6 +2326,9 @@ _run_parallel_across_cards() {
         declare -A _retry_err_files=()
         declare -A _retry_exit_files=()
         local -a _retry_pids=()
+        # Reset per round: same heavy-lane isolation as the primary probe
+        # fan-out above, layered on the existing _n_cards throttle.
+        local _active_heavy_pid=""
         for i in "${_retry_idx[@]}"; do
             echo "[torch_oot_device_tests_run_serial]   $(basename "${TEST_FILES[$i]}") collect-only was signal-killed or interrupted (exit ${_exit_map[$i]:-unknown}) -- retrying (round ${_retry_round})." >&2
             local _rf2="${RUN_FILES[$i]}"
@@ -2305,6 +2338,15 @@ _run_parallel_across_cards() {
             _retry_out_files[$i]="$_rout"
             _retry_err_files[$i]="$_rerr"
             _retry_exit_files[$i]="$_rexit"
+
+            local _is_heavy=0 _hb
+            for _hb in "${_HEAVY_COLLECT_BASENAMES[@]}"; do
+                [[ "$(basename "${TEST_FILES[$i]}")" == "$_hb" ]] && { _is_heavy=1; break; }
+            done
+            if [[ $_is_heavy -eq 1 && -n "$_active_heavy_pid" ]]; then
+                wait "$_active_heavy_pid" 2>/dev/null || true
+            fi
+
             (
                 set +euo pipefail
                 export SPYRE_TEST_FILE="$_rf2"
@@ -2320,6 +2362,7 @@ _run_parallel_across_cards() {
                 echo "${PIPESTATUS[0]}" > "$_rexit"
             ) &
             _retry_pids+=($!)
+            [[ $_is_heavy -eq 1 ]] && _active_heavy_pid=$!
             while [[ "$(jobs -rp | wc -l)" -ge "$_n_cards" ]]; do
                 wait -n 2>/dev/null || true
             done
