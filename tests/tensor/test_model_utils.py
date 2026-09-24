@@ -45,13 +45,7 @@ DLFLOAT16_ATOL = 1e-4
 
 def _spyre_available() -> bool:
     """Return True iff a physical Spyre device is accessible."""
-    try:
-        from torch_spyre.constants import DEVICE_NAME
-
-        torch.zeros(1, dtype=torch.float16, device=DEVICE_NAME)
-        return True
-    except Exception:
-        return False
+    return hasattr(torch, "spyre") and torch.spyre.is_available()
 
 
 #: Decorator: skip the test when no Spyre hardware is present.
