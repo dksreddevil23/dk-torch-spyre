@@ -399,6 +399,25 @@ def compile_backend(pytestconfig):
 def pytest_configure(config):
     shared_config._PYTEST_CONFIG = config
 
+    if config.getoption("collectonly"):
+        # A bare torch.manual_seed(N) -- one of the most common lines in any
+        # PyTorch test file, upstream ones included -- calls torch's own
+        # _seed_custom_device(), which does
+        # getattr(torch, "spyre").manual_seed_all(seed) for every registered
+        # accelerator unconditionally, including at module/class-body scope
+        # (i.e. as a side effect of collection, before any test runs). That
+        # lazy-inits the real Spyre runtime and opens a physical device,
+        # which collides with whatever else already holds it during
+        # --collect-only. Since we can't edit upstream test files, no-op the
+        # module-level seed hooks for the duration of this collect-only
+        # invocation instead; a real test run never sets --collect-only, so
+        # on-device seeding is unaffected outside of this probe.
+        import torch
+
+        if hasattr(torch, "spyre"):
+            torch.spyre.manual_seed = lambda *args, **kwargs: None
+            torch.spyre.manual_seed_all = lambda *args, **kwargs: None
+
     config.addinivalue_line(
         "markers",
         "requires_spyre_profiler: test requires Spyre hardware "

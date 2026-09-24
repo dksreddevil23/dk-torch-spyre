@@ -47,14 +47,7 @@ from torch.testing._internal.common_utils import TestCase, run_tests
 
 
 def _spyre_available() -> bool:
-    try:
-        import torch_spyre  # noqa: F401
-        from torch_spyre.constants import DEVICE_NAME
-
-        torch.zeros(1, dtype=torch.float16, device=DEVICE_NAME)
-        return True
-    except Exception:
-        return False
+    return hasattr(torch, "spyre") and torch.spyre.is_available()
 
 
 pytestmark = pytest.mark.skipif(
