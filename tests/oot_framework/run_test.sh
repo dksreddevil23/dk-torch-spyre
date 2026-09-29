@@ -2225,6 +2225,21 @@ _run_parallel_across_cards() {
             set +euo pipefail
             export SPYRE_TEST_FILE="$_rf"
             export OOT_TEST_FILE="$_rf"
+            # Concurrent probes all import from the same source tree and, unless
+            # told otherwise, share two mutable filesystem caches CPython/pytest
+            # never designed for multi-process concurrent access: the .pyc
+            # bytecode cache next to each source file, and .pytest_cache under
+            # rootdir. A probe that loses a race on either can observe a
+            # partially-written/stale file and instantiate an incomplete set of
+            # test classes -- this is a plausible cause of the same "handful of
+            # heavy-import files still failed on a contended attempt" residue
+            # noted below even after TORCHINDUCTOR_CACHE_DIR was isolated per
+            # slot, since that isolation only covers Inductor's own cache, not
+            # these two. PYTHONDONTWRITEBYTECODE avoids the .pyc race entirely
+            # (compile from source in memory every time); -p no:cacheprovider
+            # disables pytest's own cache plugin so .pytest_cache is never
+            # touched by these probes.
+            export PYTHONDONTWRITEBYTECODE=1
             # Give this probe its own Inductor cache dir so concurrent collect-only imports
             # don't share cache state. Bucketed by the same concurrency bound as the probe
             # throttle (not by file), so only _n_cards dirs ever exist -- keying by file index
@@ -2240,7 +2255,7 @@ _run_parallel_across_cards() {
             export TORCHINDUCTOR_CACHE_DIR="${_probe_base_cache}__collect_slot${_probe_slot}"
             cd "$_rd" && python3 -m pytest "$_rb" \
                 "${_collect_args[@]+"${_collect_args[@]}"}" \
-                --collect-only -q --no-header 2>"$_cerr" \
+                --collect-only -q --no-header -p no:cacheprovider 2>"$_cerr" \
             | grep '\.py::' > "$_cout"
             # python3's own exit code (PIPESTATUS[0], not grep's), so a signal kill shows up even with empty stdout/stderr.
             echo "${PIPESTATUS[0]}" > "$_cexit"
@@ -2336,11 +2351,13 @@ _run_parallel_across_cards() {
                 set +euo pipefail
                 export SPYRE_TEST_FILE="$_rf2"
                 export OOT_TEST_FILE="$_rf2"
+                # Same .pyc/.pytest_cache isolation as the initial fan-out above.
+                export PYTHONDONTWRITEBYTECODE=1
                 # A dedicated cache dir for the retry too, so it can't collide with whatever else is still running.
                 export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/tmp/torchinductor_${USER:-$(id -un)}}__retry_${i}"
                 cd "$(dirname "$_rf2")" && python3 -m pytest "$(basename "$_rf2")" \
                     "${_collect_args[@]+"${_collect_args[@]}"}" \
-                    --collect-only -q --no-header 2>"$_rerr" \
+                    --collect-only -q --no-header -p no:cacheprovider 2>"$_rerr" \
                 | grep '\.py::' > "$_rout"
                 echo "${PIPESTATUS[0]}" > "$_rexit"
             ) &
@@ -2545,6 +2562,19 @@ _run_parallel_across_cards() {
             # directory (OSError ENOTEMPTY).
             _base_cache="${TORCHINDUCTOR_CACHE_DIR:-/tmp/torchinductor_${USER:-$(id -un)}}"
             export TORCHINDUCTOR_CACHE_DIR="${_base_cache}__card_${_subshell_card}"
+            # Every card's pytest process imports the same wrapper file from the
+            # same run_dir at (nearly) the same instant. Unlike the Inductor
+            # cache above, the .pyc bytecode cache next to the source file and
+            # pytest's own .pytest_cache under rootdir are shared, mutable
+            # filesystem state that neither CPython nor pytest designed for
+            # concurrent multi-process access. A card that loses that race can
+            # import an incompletely-written .pyc and instantiate only a subset
+            # of the wrapper's test classes/methods, which then shows up as
+            # "ERROR: not found: ...::test_foo" for node IDs another card's
+            # process resolved just fine -- not a device or node-ID-assignment
+            # bug, just two independent `python3 -m pytest` processes sharing
+            # state they were never meant to share.
+            export PYTHONDONTWRITEBYTECODE=1
             local _card_overall=0
 
             # Group the assigned lines by file index using an associative array.
@@ -2592,11 +2622,15 @@ _run_parallel_across_cards() {
                 # Build pytest args: base args + node IDs as positional args.
                 # Node IDs are passed as bare names (no file prefix) because
                 # pytest is invoked from run_dir with run_basename as the target.
+                # -p no:cacheprovider: this card's process must not touch the
+                # shared .pytest_cache under rootdir while other cards' pytest
+                # processes are concurrently reading/writing it (see
+                # PYTHONDONTWRITEBYTECODE above for the matching .pyc concern).
                 local -a _file_args
                 if [[ -n "$_shard_xml" ]]; then
-                    _file_args=("${_EXTRA_NO_XML[@]+"${_EXTRA_NO_XML[@]}"}" "--junit-xml=${_shard_xml}")
+                    _file_args=("${_EXTRA_NO_XML[@]+"${_EXTRA_NO_XML[@]}"}" "--junit-xml=${_shard_xml}" "-p" "no:cacheprovider")
                 else
-                    _file_args=("${_EXTRA_NO_XML[@]+"${_EXTRA_NO_XML[@]}"}")
+                    _file_args=("${_EXTRA_NO_XML[@]+"${_EXTRA_NO_XML[@]}"}" "-p" "no:cacheprovider")
                 fi
 
                 export SPYRE_TEST_FILE="$run_file"
