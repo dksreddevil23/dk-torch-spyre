@@ -52,19 +52,26 @@ class _SpyreImpl:
         self._lazy_init()
         return super().__getattribute__(name)
 
-    def _lazy_init(self):
-        if self._initialized:
+    def _prepare_c_extension(self):
+        """Import the native extension and apply cheap, runtime-independent
+        setup (logging config sync, pending device index), without starting
+        the device runtime.
+
+        RNG-only entry points (manual_seed*, {get,set}_rng_state,
+        initial_seed) only need this: the default generators are pure
+        host-side state (see SpyreGeneratorImpl) with no dependency on
+        GlobalRuntime, so forcing a physical device open for them turns
+        harmless calls like `torch.manual_seed(seed)` -- which
+        torch.testing._internal.common_utils runs at import time -- into a
+        device acquisition, causing spurious contention when multiple
+        processes merely import a test module concurrently (e.g. pytest
+        collection across cards).
+        """
+        if self._C is not None:
             return
         with _runtime_init_lock:
-            if self._initialized:
+            if self._C is not None:
                 return
-            # Start the device runtime. This is the ONLY thing _lazy_init does:
-            # all runtime-independent setup (tensor monkey-patch, inductor backend
-            # registration, dispatch-key kernels) is applied at import time in the
-            # top-level _autoload() so it is available before the first device op.
-            # The C++ startRuntime() is std::call_once, so eager device ops trigger
-            # it independently of this Python path; this remains for callers that
-            # want explicit runtime init.
             self._C = importlib.import_module("torch_spyre._C")
             from torch_spyre import logging_config
 
@@ -73,6 +80,14 @@ class _SpyreImpl:
             pending = self._pending_device_idx
             if pending is not None:
                 self._C.set_device(pending)
+
+    def _lazy_init(self):
+        if self._initialized:
+            return
+        with _runtime_init_lock:
+            if self._initialized:
+                return
+            self._prepare_c_extension()
             # this will create the allocator
             self._C.start_runtime()
             self._initialized = True
@@ -81,7 +96,7 @@ class _SpyreImpl:
         return self._in_bad_fork
 
     def manual_seed(self, seed: int, device: int | None = None) -> None:
-        self._lazy_init()
+        self._prepare_c_extension()
         _C = self._C
 
         idx = -1 if device is None else int(device)
@@ -89,7 +104,7 @@ class _SpyreImpl:
         default_generator.manual_seed(seed)
 
     def manual_seed_all(self, seed: int) -> None:
-        self._lazy_init()
+        self._prepare_c_extension()
         _C = self._C
 
         for idx in range(self.device_count()):
@@ -99,7 +114,7 @@ class _SpyreImpl:
     def set_rng_state(
         self, new_state: torch.Tensor, device: int | str | torch.device = "spyre"
     ) -> None:
-        self._lazy_init()
+        self._prepare_c_extension()
         _C = self._C
 
         if isinstance(device, str):
@@ -112,7 +127,7 @@ class _SpyreImpl:
         default_generator.set_state(new_state)
 
     def get_rng_state(self, device: int | str | torch.device = "spyre") -> torch.Tensor:
-        self._lazy_init()
+        self._prepare_c_extension()
         _C = self._C
 
         if isinstance(device, str):
@@ -125,7 +140,7 @@ class _SpyreImpl:
         return default_generator.get_state()
 
     def initial_seed(self, device: int | str | torch.device = "spyre") -> int:
-        self._lazy_init()
+        self._prepare_c_extension()
         _C = self._C
 
         if isinstance(device, str):

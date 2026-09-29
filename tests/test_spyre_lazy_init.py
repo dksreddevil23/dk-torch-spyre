@@ -95,6 +95,69 @@ class TestSpyre(TestCase):
         )
         assert out.endswith("OK"), f"unexpected stdout:\n{out}\nstderr:\n{err}"
 
+    def test_manual_seed_does_not_start_runtime(self):
+        """torch.manual_seed(seed) must not open a physical device.
+
+        torch.testing._internal.common_utils calls torch.manual_seed(SEED)
+        at import time, which cascades into torch.spyre.manual_seed_all().
+        Every upstream test file imports common_utils, so if manual_seed_all
+        eagerly started the runtime, merely *collecting* (importing) any
+        such file would acquire a real Spyre card -- causing spurious
+        device-open contention when multiple processes collect concurrently
+        (e.g. pytest --collect-only fanned out across cards). The default
+        generators are pure host-side RNG state (see SpyreGeneratorImpl) and
+        never needed the runtime to be started to be seeded.
+
+        Run in a fresh process so the result is not contaminated by other
+        tests that already started the runtime in this session.
+        """
+        import sys
+        import subprocess
+        import textwrap
+
+        script = textwrap.dedent("""
+            import torch
+            import torch_spyre  # noqa: F401
+
+            torch.manual_seed(0xC0FFEE)
+
+            assert torch.spyre.is_initialized() is False, (
+                "runtime was initialized by torch.manual_seed() alone"
+            )
+
+            # The seed must still have taken effect on the default generator.
+            assert torch.spyre.initial_seed() == 0xC0FFEE, (
+                "seed was not applied to the default generator"
+            )
+
+            # Still must not have started the runtime as a side effect of
+            # reading it back.
+            assert torch.spyre.is_initialized() is False, (
+                "runtime was initialized while reading back the seed"
+            )
+
+            print("OK")
+        """)
+
+        env = os.environ.copy()
+        env["DT_DEEPRT_VERBOSE"] = "-1"
+        env["DTLOG_LEVEL"] = "error"
+
+        proc = subprocess.run(
+            [sys.executable, "-c", script],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            timeout=130,
+            text=True,
+        )
+        out = (proc.stdout or "").strip()
+        err = (proc.stderr or "").strip()
+        assert proc.returncode == 0, (
+            f"subprocess failed (rc={proc.returncode}).\nstdout:\n{out}\nstderr:\n{err}"
+        )
+        assert out.endswith("OK"), f"unexpected stdout:\n{out}\nstderr:\n{err}"
+
 
 if __name__ == "__main__":
     run_tests()
