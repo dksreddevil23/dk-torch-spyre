@@ -54,32 +54,16 @@
 # Segfault resilience
 # -------------------
 # If a file-level pytest run exits with any signal (exit >= 128, e.g. SIGSEGV/139
-# or C-level abort/255), the crashed batch of node IDs is recovered by
-# _run_signal_retry_loop: a multi-round "-n1" pytest-xdist retry (not a single
-# one-shot attempt) that keeps making progress until every id in the batch has
-# a real recorded outcome, or a bounded round/time budget is exhausted.
+# or C-level abort/255), the file is automatically retried with "-n1" via
+# pytest-xdist.  xdist spawns each test in a worker subprocess; when a worker
+# crashes the xdist controller catches the worker death, records that test as
+# ERROR, and continues with the remaining tests.
 #
-# Each round waits for the crashed process's VFIO device handle to actually
-# release (_wait_for_vfio_release) before retrying -- a same-device retry
-# launched too early reliably fails with RAS::VFIO::DeviceOpenFail, since the
-# kernel's IOMMU/DMA-mapping teardown for a killed process can lag behind its
-# file descriptor closing. xdist's own internal worker-restart-after-crash is
-# deliberately disabled (--max-worker-restart=0): that internal restart isn't
-# protected by our release-wait, so a crash hands control back to this loop
-# instead of two uncoordinated retry layers racing each other.
-#
-# Every completed test's result is parsed from the raw "-v" output as it
-# streams by (not just the final summary line, which doesn't exist if the
-# process dies before printing one) -- xdist's controller synthesizes a
-# report for whatever test was in flight when its worker died, so this
-# recovers everything dispatched before a crash, not just what came after.
-# If a round makes zero progress (the crash happens before the very first
-# item is even pulled -- a device-open race, not a bad test), the loop
-# escalates to running just that one id alone, still under xdist, so a
-# single reliably-broken test can never take the rest of its batch down with
-# it. --collect-only is NOT used as a recovery strategy: the process that
-# crashes during execution often also crashes during collection, yielding
-# zero IDs. Requires pytest-xdist: pip install pytest-xdist.
+# --collect-only is NOT used as the fallback strategy: the process that crashes
+# during test execution often also crashes during collection, yielding zero IDs.
+# xdist's forking model sidesteps this entirely — collection runs in the
+# controller (which stays alive) and execution runs in workers (which can crash
+# safely).  Requires pytest-xdist: pip install pytest-xdist.
 
 set -euo pipefail
 
@@ -1783,10 +1767,7 @@ print(f"[torch_oot_device_tests_run] Merged {len(shard_paths)} XML shard(s) -> {
 '
 
 # Command prefix _run_pytest_isolated applies to the pytest/torchrun invocation.
-# Always empty now: the signal-retry path (_run_signal_retry_loop) manages
-# its own timeout wrapping directly instead of going through this global, so
-# every _run_pytest_isolated call is unbounded except for the distributed
-# (torchrun) path's own internal TORCH_SPYRE_DIST_RUN_TIMEOUT.
+# Empty for normal runs; the signal-retry path sets it to bound its re-run.
 _OOT_TIMEOUT_PREFIX=()
 
 # ---------------------------------------------------------------------------
@@ -1806,8 +1787,9 @@ _run_pytest_isolated() {
     local _dir="$1" _base="$2" _exit_tmp="$3" _out_tmp="$4"
     shift 4
     local _args=("$@")
-    # Always empty (see the _OOT_TIMEOUT_PREFIX declaration above) -- kept as
-    # a hook rather than removed outright in case a future caller needs it.
+    # Empty unless the caller is the signal-retry path, which bounds its re-run
+    # against a wedged device (see _run_xdist_fallback). Normal runs are unbounded
+    # so a legitimately long suite is never cut short.
     local _tmo=("${_OOT_TIMEOUT_PREFIX[@]+"${_OOT_TIMEOUT_PREFIX[@]}"}")
     (
         set +euo pipefail
@@ -1986,496 +1968,137 @@ _wait_for_vfio_release() {
 }
 
 # ---------------------------------------------------------------------------
-# _oot_duration_to_secs <duration>
-#
-# Converts a GNU-coreutils-style duration ("15m", "90s", "1h", "45", "") to
-# whole seconds, so round-timeout math (halving, comparing against elapsed
-# SECONDS) can work in plain integers instead of re-parsing suffixed strings
-# repeatedly. Prints 0 for an empty input (callers treat 0 as "no timeout",
-# matching every other *_TIMEOUT var in this script).
-# ---------------------------------------------------------------------------
-_oot_duration_to_secs() {
-    local _d="$1"
-    [[ -z "$_d" ]] && { echo 0; return; }
-    local _num="${_d%[a-zA-Z]}"
-    local _unit="${_d: -1}"
-    [[ "$_num" =~ ^[0-9]+(\.[0-9]+)?$ ]] || { echo 0; return; }
-    case "$_unit" in
-        s) awk -v n="$_num" 'BEGIN{printf "%d", n}' ;;
-        m) awk -v n="$_num" 'BEGIN{printf "%d", n*60}' ;;
-        h) awk -v n="$_num" 'BEGIN{printf "%d", n*3600}' ;;
-        d) awk -v n="$_num" 'BEGIN{printf "%d", n*86400}' ;;
-        *) awk -v n="$_d"   'BEGIN{printf "%d", n}' ;;  # bare number = seconds
-    esac
-}
-
-# ---------------------------------------------------------------------------
-# _parse_pytest_verbose_results <output_file>
-#
-# Scans raw "-v -n1" stdout+stderr (captured via tee) line by line and prints
-# one "<bucket>\t<node_id>" pair per definitive per-test result found, even
-# from a truncated/crashed capture -- deliberately NOT based on the final
-# summary line, which may not exist if the process dies first.
-#
-# Handles pytest-xdist's verbose format (word BEFORE nodeid, "[gwN]"-
-# prefixed, percentage optional):
-#     [gw0] [ 12%] PASSED test_foo.py::TestClass::test_bar[float16]
-#     [gw0] FAILED test_foo.py::TestClass::test_bar
-# and, defensively, plain (non-xdist) verbose format (nodeid BEFORE word --
-# used only if a caller ever runs this without -n1):
-#     test_foo.py::TestClass::test_bar PASSED                    [ 12%]
-#
-# A crashed worker's in-flight test is reported this same way by xdist's own
-# handle_crashitem() synthetic report (outcome="failed" -> word "FAILED"),
-# so most mid-batch crashes are already captured here without special
-# casing, along with every test dispatched before the crash.
-#
-# Uses [^[:space:]] rather than \S (a GNU/Perl-only regex shorthand not
-# supported by all seds, e.g. BSD sed) for portability.
-#
-# bucket is one of: passed failed error skipped xfailed xpassed.
-# When the SAME node id appears more than once (e.g. a teardown ERROR line
-# after an earlier call-phase PASSED for the same test), the LAST occurrence
-# wins -- teardown failures are the more consequential outcome and pytest
-# always prints them after the call-phase result.
-# ---------------------------------------------------------------------------
-_parse_pytest_verbose_results() {
-    local _f="$1"
-    [[ -f "$_f" ]] || return 0
-    {
-        grep -aE '^\[gw[0-9]+\][[:space:]]+(\[[[:space:]]*[0-9]+%\][[:space:]]+)?(PASSED|FAILED|ERROR|SKIPPED|XFAIL|XPASS)[[:space:]]+[^[:space:]]+::[^[:space:]]+' "$_f" 2>/dev/null \
-            | sed -E 's/^\[gw[0-9]+\][[:space:]]+(\[[[:space:]]*[0-9]+%\][[:space:]]+)?(PASSED|FAILED|ERROR|SKIPPED|XFAIL|XPASS)[[:space:]]+([^[:space:]]+::[^[:space:]]+).*/\2\t\3/'
-        grep -aE '^[^[:space:]]+::[^[:space:]]+[[:space:]]+(PASSED|FAILED|ERROR|SKIPPED|XFAIL|XPASS)([[:space:]]|$)' "$_f" 2>/dev/null \
-            | sed -E 's/^([^[:space:]]+::[^[:space:]]+)[[:space:]]+(PASSED|FAILED|ERROR|SKIPPED|XFAIL|XPASS).*/\2\t\1/'
-    } | awk -F'\t' '
-        {
-            w = $1; id = $2
-            b["PASSED"]="passed"; b["FAILED"]="failed"; b["ERROR"]="error"
-            b["SKIPPED"]="skipped"; b["XFAIL"]="xfailed"; b["XPASS"]="xpassed"
-            last[id] = b[w]
-        }
-        END { for (id in last) print last[id] "\t" id }
-    '
-}
-
-# ---------------------------------------------------------------------------
-# _run_signal_retry_loop <run_dir> <original_file> <shard_xml_base> \
-#                        <summary_file> <shard_list_file> <counts_file> \
-#                        <suite_label> <extra_pytest_arg>... -- <node_id>...
-#
-# Recovers a signal-exit batch with a bounded, multi-round retry: keeps
-# retrying the still-unresolved subset of node IDs under "-n1" pytest-xdist,
-# parsing every individual test result from the verbose output stream (not
-# just the final summary line) so a crash never loses more than what's
-# actually unrecoverable. A round that makes zero progress (the crash
-# happens before the first item is even pulled -- a device-open race, not a
-# bad test) escalates to running just the first remaining id alone, so one
-# reliably-broken test can't take the rest of the batch down with it.
-#
-# Bounded two ways -- whichever hits first ends the loop:
-#   OOT_SIGNAL_RETRY_MAX_ROUNDS (default 10) whole-batch rounds.
-#   OOT_SIGNAL_RETRY_TOTAL_TIMEOUT (default 20m) total elapsed wall-clock,
-#     tracked via the bash SECONDS builtin from the loop's start.
-# Per-round timeout shrinks after round 1: OOT_FALLBACK_TIMEOUT (default
-# 15m) on round 1, half that on round 2, OOT_SIGNAL_RETRY_SINGLE_TIMEOUT's
-# floor (default 3m) on round 3+ -- most recoverable crashes resolve on the
-# first real attempt, so later rounds don't need the full budget.
-# Every attempt (each round AND each escalation) is preceded by
-# _wait_for_vfio_release, not just the first.
-#
-# Writes results to <summary_file> as "FILE_RESULT <label> <status> ..." /
-# "FAILED_TEST <name>" lines (same wire format _run_parallel_across_cards'
-# per-card subshells already use), one consolidated shard xml path per line
-# to <shard_list_file>, and one suite-count line to <counts_file> (pass ""
-# for either counts_file or suite_label to skip suite accumulation).
-# <label> is the plain basename of <original_file> -- no suffix -- so it
-# merges into the SAME row as any other card's clean slice of the same file
-# via the existing FILE_RESULT aggregation (sum counts, SIGNAL > FAIL >
-# ERROR > PASS > NOTEST status priority).
-#
-# Returns 0 (PASS), 1 (FAIL -- test failures only, maskable by the caller's
-# own --mode=validate handling), or 2 (ERROR/SIGNAL -- never maskable).
-# ---------------------------------------------------------------------------
-_run_signal_retry_loop() {
-    local _run_dir="$1" _orig_file="$2" _shard_xml_base="$3"
-    local _summary_file="$4" _shard_list_file="$5" _counts_file="$6"
-    local _suite_lbl="$7"
-    shift 7
-    local -a _extra_args=()
-    while [[ $# -gt 0 && "$1" != "--" ]]; do
-        _extra_args+=("$1")
-        shift
-    done
-    shift  # drop the -- separator
-    local -a _all_ids=("$@")
-    local _label
-    _label="$(basename "$_orig_file")"
-    local _tag="${_label//[^A-Za-z0-9_.-]/_}"
-
-    if [[ ${#_all_ids[@]} -eq 0 ]]; then
-        return 0
-    fi
-
-    if ! python3 -c "import xdist" 2>/dev/null; then
-        echo "[torch_oot_device_tests_run] WARNING: pytest-xdist not installed -- cannot recover a signal exit for ${_label}." >&2
-        echo "[torch_oot_device_tests_run]          Install with: pip install pytest-xdist" >&2
-        echo "FILE_RESULT ${_label} SIGNAL 0 0 0 0 0 0 0" >> "$_summary_file"
-        return 2
-    fi
-
-    local -a _remaining_order=("${_all_ids[@]}")
-    local -A _remaining_set=()
-    local _id
-    for _id in "${_all_ids[@]}"; do
-        _remaining_set["$_id"]=1
-    done
-
-    local _tot_p=0 _tot_f=0 _tot_e=0 _tot_s=0 _tot_xf=0 _tot_xp=0
-    local -a _resolved_fail_ids=()
-
-    local _max_rounds="${OOT_SIGNAL_RETRY_MAX_ROUNDS:-10}"
-    local _total_timeout_secs
-    _total_timeout_secs="$(_oot_duration_to_secs "${OOT_SIGNAL_RETRY_TOTAL_TIMEOUT-20m}")"
-    local _round1_timeout_secs
-    _round1_timeout_secs="$(_oot_duration_to_secs "${OOT_FALLBACK_TIMEOUT-15m}")"
-    local _single_timeout_secs
-    _single_timeout_secs="$(_oot_duration_to_secs "${OOT_SIGNAL_RETRY_SINGLE_TIMEOUT-3m}")"
-    local _loop_start=$SECONDS
-
-    local _round=0
-    while [[ ${#_remaining_set[@]} -gt 0 && $_round -lt $_max_rounds ]]; do
-        if [[ $_total_timeout_secs -gt 0 && $(( SECONDS - _loop_start )) -ge $_total_timeout_secs ]]; then
-            echo "[torch_oot_device_tests_run] WARNING: signal-retry total budget (${OOT_SIGNAL_RETRY_TOTAL_TIMEOUT-20m}) exhausted for ${_label} -- ${#_remaining_set[@]} id(s) unresolved." >&2
-            break
-        fi
-        _round=$(( _round + 1 ))
-
-        local _round_timeout_secs
-        if [[ $_round -eq 1 ]]; then
-            _round_timeout_secs=$_round1_timeout_secs
-        elif [[ $_round -eq 2 ]]; then
-            _round_timeout_secs=$(( _round1_timeout_secs / 2 ))
-            [[ $_round_timeout_secs -lt $_single_timeout_secs ]] && _round_timeout_secs=$_single_timeout_secs
-        else
-            _round_timeout_secs=$_single_timeout_secs
-        fi
-
-        local -a _round_args=()
-        for _id in "${_remaining_order[@]}"; do
-            [[ -n "${_remaining_set[$_id]+set}" ]] && _round_args+=("$_id")
-        done
-
-        _wait_for_vfio_release "round ${_round}/${_max_rounds} for ${_label}"
-
-        echo "[torch_oot_device_tests_run] signal-retry round ${_round}/${_max_rounds} for ${_label}: ${#_round_args[@]} id(s) remaining." >&2
-
-        local _round_out="/tmp/_spyre_sigretry_out_${$}_${_tag}_r${_round}.tmp"
-        local _round_exit_tmp="/tmp/_spyre_sigretry_exit_${$}_${_tag}_r${_round}.tmp"
-        local -a _round_pytest_args=("-n1" "--max-worker-restart=0" "-v" "${_extra_args[@]+"${_extra_args[@]}"}")
-        local _round_xml=""
-        if [[ -n "$_shard_xml_base" ]]; then
-            _round_xml="${_shard_xml_base%.xml}__retry_r${_round}.xml"
-            _round_pytest_args+=("--junit-xml=${_round_xml}")
-        fi
-        local -a _round_tmo=()
-        if [[ $_round_timeout_secs -gt 0 ]] && command -v timeout >/dev/null 2>&1; then
-            _round_tmo=("timeout" "--foreground" "--signal=KILL" "${_round_timeout_secs}s")
-        fi
-
-        (
-            set +euo pipefail
-            cd "$_run_dir"
-            "${_round_tmo[@]+"${_round_tmo[@]}"}" python3 -m pytest "${_round_args[@]}" "${_round_pytest_args[@]}" 2>&1 | tee "$_round_out"
-            echo "${PIPESTATUS[0]}" > "$_round_exit_tmp"
-        ) || true
-        rm -f "$_round_exit_tmp"
-
-        local -A _round_resolved=()
-        local _bucket _nid
-        while IFS=$'\t' read -r _bucket _nid; do
-            [[ -z "$_nid" ]] && continue
-            [[ -n "${_remaining_set[$_nid]+set}" ]] || continue
-            _round_resolved["$_nid"]="$_bucket"
-        done < <(_parse_pytest_verbose_results "$_round_out")
-
-        local _before=${#_remaining_set[@]}
-        for _id in "${!_round_resolved[@]}"; do
-            unset "_remaining_set[$_id]"
-            case "${_round_resolved[$_id]}" in
-                passed)  _tot_p=$((_tot_p+1)) ;;
-                failed)  _tot_f=$((_tot_f+1)); _resolved_fail_ids+=("$_id") ;;
-                error)   _tot_e=$((_tot_e+1)) ;;
-                skipped) _tot_s=$((_tot_s+1)) ;;
-                xfailed) _tot_xf=$((_tot_xf+1)) ;;
-                xpassed) _tot_xp=$((_tot_xp+1)) ;;
-            esac
-        done
-        local _after=${#_remaining_set[@]}
-
-        if [[ -f "$_round_xml" ]]; then
-            python3 -c "$_XML_INJECT_PY" "$_round_xml" "$YAML_CONFIG" || true
-            echo "$_round_xml" >> "$_shard_list_file"
-        fi
-        rm -f "$_round_out"
-
-        [[ $_after -eq 0 ]] && break
-
-        if [[ $_after -eq $_before ]]; then
-            # Zero progress: the crash happened before even the first item
-            # was pulled (device-open race), not a specific bad test caught
-            # mid-batch. Escalate to a single-id isolated attempt so this
-            # doesn't repeat forever against the whole remaining batch.
-            local _poison=""
-            for _id in "${_remaining_order[@]}"; do
-                if [[ -n "${_remaining_set[$_id]+set}" ]]; then _poison="$_id"; break; fi
-            done
-            [[ -z "$_poison" ]] && break
-
-            echo "[torch_oot_device_tests_run] WARNING: round ${_round} made no progress on ${_label} -- isolating ${_poison}." >&2
-            _wait_for_vfio_release "isolated retry for ${_poison}"
-
-            local _iso_out="/tmp/_spyre_sigretry_iso_${$}_${_tag}_r${_round}.tmp"
-            local _iso_exit_tmp="/tmp/_spyre_sigretry_iso_exit_${$}_${_tag}_r${_round}.tmp"
-            local -a _iso_pytest_args=("-n1" "--max-worker-restart=0" "-v" "${_extra_args[@]+"${_extra_args[@]}"}")
-            local _iso_xml=""
-            if [[ -n "$_shard_xml_base" ]]; then
-                _iso_xml="${_shard_xml_base%.xml}__retry_r${_round}_iso.xml"
-                _iso_pytest_args+=("--junit-xml=${_iso_xml}")
-            fi
-            local -a _iso_tmo=()
-            if [[ $_single_timeout_secs -gt 0 ]] && command -v timeout >/dev/null 2>&1; then
-                _iso_tmo=("timeout" "--foreground" "--signal=KILL" "${_single_timeout_secs}s")
-            fi
-            (
-                set +euo pipefail
-                cd "$_run_dir"
-                "${_iso_tmo[@]+"${_iso_tmo[@]}"}" python3 -m pytest "$_poison" "${_iso_pytest_args[@]}" 2>&1 | tee "$_iso_out"
-                echo "${PIPESTATUS[0]}" > "$_iso_exit_tmp"
-            ) || true
-            rm -f "$_iso_exit_tmp"
-
-            local _iso_resolved=0
-            while IFS=$'\t' read -r _bucket _nid; do
-                [[ "$_nid" == "$_poison" ]] || continue
-                _iso_resolved=1
-                unset "_remaining_set[$_poison]"
-                case "$_bucket" in
-                    passed)  _tot_p=$((_tot_p+1)) ;;
-                    failed)  _tot_f=$((_tot_f+1)); _resolved_fail_ids+=("$_nid") ;;
-                    error)   _tot_e=$((_tot_e+1)) ;;
-                    skipped) _tot_s=$((_tot_s+1)) ;;
-                    xfailed) _tot_xf=$((_tot_xf+1)) ;;
-                    xpassed) _tot_xp=$((_tot_xp+1)) ;;
-                esac
-            done < <(_parse_pytest_verbose_results "$_iso_out")
-            rm -f "$_iso_out"
-
-            if [[ -f "$_iso_xml" ]]; then
-                python3 -c "$_XML_INJECT_PY" "$_iso_xml" "$YAML_CONFIG" || true
-                echo "$_iso_xml" >> "$_shard_list_file"
-            fi
-
-            if [[ $_iso_resolved -eq 0 ]]; then
-                echo "[torch_oot_device_tests_run] WARNING: ${_poison} crashed even in isolation -- recording as error." >&2
-                unset "_remaining_set[$_poison]"
-                _tot_e=$((_tot_e+1))
-            fi
-        fi
-    done
-
-    local _unresolved=${#_remaining_set[@]}
-    if [[ $_unresolved -gt 0 ]]; then
-        echo "[torch_oot_device_tests_run] WARNING: ${_unresolved} id(s) still unresolved for ${_label} after ${_round} round(s) -- recording as error." >&2
-        _tot_e=$(( _tot_e + _unresolved ))
-    fi
-
-    local _status
-    local _total_resolved=$(( _tot_p + _tot_f + _tot_e + _tot_s + _tot_xf + _tot_xp ))
-    if [[ $_total_resolved -eq 0 ]]; then
-        _status="SIGNAL"
-    elif [[ $_tot_f -gt 0 ]]; then
-        _status="FAIL"
-    elif [[ $_tot_e -gt 0 ]]; then
-        _status="ERROR"
-    else
-        _status="PASS"
-    fi
-
-    echo "FILE_RESULT ${_label} ${_status} ${_tot_p} ${_tot_f} ${_tot_e} ${_tot_s} ${_tot_xf} ${_tot_xp} 0" >> "$_summary_file"
-    for _id in "${_resolved_fail_ids[@]+"${_resolved_fail_ids[@]}"}"; do
-        echo "FAILED_TEST ${_id}" >> "$_summary_file"
-    done
-    if [[ -n "$_counts_file" && -n "$_suite_lbl" ]]; then
-        echo "${_suite_lbl} ${_tot_p} ${_tot_f} ${_tot_e} ${_tot_s} ${_tot_xf} ${_tot_xp} 0" >> "$_counts_file"
-    fi
-
-    case "$_status" in
-        PASS) return 0 ;;
-        FAIL) return 1 ;;
-        *)    return 2 ;;
-    esac
-}
-
-# ---------------------------------------------------------------------------
 # _run_xdist_fallback <run_dir> <run_basename> <original_file>
 #                     <exit_tmp> <shard_xml> [pytest_args...]
 #
 # Called when a file-level pytest run exits with a signal (exit >= 128, most
 # commonly SIGSEGV or exit 255 from a C-level abort).
 #
-# Bootstraps a node-ID list for the crashed file via a fresh --collect-only
-# probe (device-agnostic, like _run_parallel_across_cards' own collection --
-# a defensive _wait_for_vfio_release costs nothing if the crashed run's
-# device handle hasn't fully released yet), then delegates recovery to
-# _run_signal_retry_loop -- the same bounded, multi-round, ID-level retry
-# _run_parallel_across_cards' per-card path uses, so a single reliably-
-# crashing test can never take the rest of the file down with it here either.
+# Re-runs the same file with "-n1" (pytest-xdist, 1 worker subprocess).
+# xdist spawns each test in a worker process; when a worker crashes the
+# xdist controller catches the worker death, marks that test as ERROR, and
+# continues with the remaining tests
+#
+#   The process that segfaults during test execution is often the same Python
+#   interpreter that would run --collect-only, so collection itself crashes
+#   and yields zero IDs.  xdist's forking model sidesteps this entirely.
 #
 # Arguments:
 #   $1  run_dir       -- directory to cd into for pytest
 #   $2  run_basename  -- pytest target (wrapper or original filename)
 #   $3  original_file -- original source path (logging only)
-#   $4  exit_tmp      -- unused (kept so existing call sites don't need to change)
+#   $4  exit_tmp      -- temp file path for exit code (reused from caller)
 #   $5  shard_xml     -- destination XML path (empty if no --junit-xml)
 #   $6  suite_label   -- YAML label for per-suite accumulation (may be "")
 #   rest              -- extra pytest args (already stripped of --junit-xml)
 #
 # Side-effects:
-#   - Updates global OVERALL_EXIT, _FILE_SUMMARY_*, _ALL_FAILED_TESTS, _XML_SHARDS.
+#   - Updates global OVERALL_EXIT.
+#   - Injects XML tags into shard_xml when present.
 #   - Accumulates per-suite counts into _SUITE_LABELS/_SUITE_COUNTS.
 # ---------------------------------------------------------------------------
 _run_xdist_fallback() {
     local _dir="$1" _base="$2" _orig="$3" _exit_tmp="$4" _shard_xml="$5" _suite_lbl="$6"
     shift 6
-    local -a _extra=("$@")
-    rm -f "$_exit_tmp"
+    local _extra=("$@")
 
     export SPYRE_TEST_FILE="${_dir}/${_base}"
     export OOT_TEST_FILE="${_dir}/${_base}"
-    local _label
-    _label="$(basename "$_orig")"
 
     echo ""
-    echo "[torch_oot_device_tests_run] *** SIGNAL EXIT — recovering with a multi-round -n1 (xdist) retry ***"
+    echo "[torch_oot_device_tests_run] *** SIGNAL EXIT — retrying with -n1 (xdist worker isolation) ***"
     echo "[torch_oot_device_tests_run]     File: $_orig"
+    echo "[torch_oot_device_tests_run]     Each test runs in its own worker; crashes are contained."
     echo ""
 
-    if ! python3 -c "import xdist" 2>/dev/null; then
-        echo "[torch_oot_device_tests_run] WARNING: pytest-xdist not installed — cannot recover a signal exit." >&2
-        echo "[torch_oot_device_tests_run]          Install with: pip install pytest-xdist" >&2
-        echo "[torch_oot_device_tests_run]          Skipping remaining tests in: $_orig" >&2
-        [[ $OVERALL_EXIT -eq 0 ]] && OVERALL_EXIT=1
-        _FILE_SUMMARY_LABELS+=("$_label")
-        _FILE_SUMMARY_STATUS+=("SIGNAL")
-        _FILE_SUMMARY_COUNTS+=("0 0 0 0 0 0 0")
-        return
-    fi
-
-    # Bootstrap a node-ID list: the retry loop needs explicit ids, unlike the
-    # single-shot "-n1 <whole file>" approach this replaces. Only the -m
-    # marker filter (if present in the caller's extra args) affects which
-    # ids get collected; everything else is applied only at execution time.
-    _wait_for_vfio_release "post-crash bootstrap collection for $_label"
-    local -a _bootstrap_collect_args=()
-    local _take_next=0
-    local _a
-    for _a in "${_extra[@]+"${_extra[@]}"}"; do
-        if [[ $_take_next -eq 1 ]]; then _bootstrap_collect_args+=("$_a"); _take_next=0; continue; fi
-        [[ "$_a" == "-m" ]] && { _bootstrap_collect_args+=("$_a"); _take_next=1; }
-    done
-
-    local _boot_out="/tmp/_spyre_sigretry_boot_${$}_$$.tmp"
-    local _boot_err="/tmp/_spyre_sigretry_boot_err_${$}_$$.tmp"
-    (
-        set +euo pipefail
-        cd "$_dir" && python3 -m pytest "$_base" "${_bootstrap_collect_args[@]+"${_bootstrap_collect_args[@]}"}" \
-            --collect-only -q --no-header 2>"$_boot_err" \
-        | grep '\.py::' > "$_boot_out"
-    ) || true
-
-    local -a _boot_ids=()
-    if [[ -f "$_boot_out" ]]; then
-        local _bid _file_part _rest
-        while IFS= read -r _bid; do
-            [[ -z "$_bid" ]] && continue
-            _file_part="${_bid%%::*}"
-            _rest="${_bid#*::}"
-            _file_part="${_file_part##*/}"
-            _boot_ids+=("${_file_part}::${_rest}")
-        done < "$_boot_out"
-    fi
-    if [[ -s "$_boot_err" ]]; then
-        echo "[torch_oot_device_tests_run]   ----- bootstrap collect-only stderr for $_label -----" >&2
-        sed 's/^/[torch_oot_device_tests_run]   /' "$_boot_err" >&2
-        echo "[torch_oot_device_tests_run]   ----- end stderr -----" >&2
-    fi
-    rm -f "$_boot_out" "$_boot_err"
-
-    if [[ ${#_boot_ids[@]} -eq 0 ]]; then
-        # Graceful degrade: never worse than the previous single-shot
-        # behavior's own worst case (an unrecoverable file recorded as a
-        # bare zero-count SIGNAL row).
-        echo "[torch_oot_device_tests_run] WARNING: post-crash bootstrap collection produced no test IDs for $_orig -- cannot recover individual results." >&2
-        [[ $OVERALL_EXIT -eq 0 ]] && OVERALL_EXIT=1
-        _FILE_SUMMARY_LABELS+=("$_label")
-        _FILE_SUMMARY_STATUS+=("SIGNAL")
-        _FILE_SUMMARY_COUNTS+=("0 0 0 0 0 0 0")
-        return
-    fi
-
-    local _summary_file="/tmp/_spyre_sigretry_summary_${$}_$$.tmp"
-    local _shard_list_file="/tmp/_spyre_sigretry_shards_${$}_$$.tmp"
-    local _counts_file="/tmp/_spyre_sigretry_counts_${$}_$$.tmp"
-    : > "$_summary_file"
-    : > "$_shard_list_file"
-    : > "$_counts_file"
-
-    local _loop_rc=0
-    _run_signal_retry_loop "$_dir" "$_orig" "$_shard_xml" \
-        "$_summary_file" "$_shard_list_file" "$_counts_file" "$_suite_lbl" \
-        "${_extra[@]+"${_extra[@]}"}" -- "${_boot_ids[@]}" || _loop_rc=$?
-
-    # Drain the loop's results into this (main-shell, not a subshell) process's
-    # globals -- the same FILE_RESULT/FAILED_TEST wire format
-    # _run_parallel_across_cards' per-card subshells already produce.
-    local _sline _stype _srest
-    while IFS= read -r _sline; do
-        [[ -z "$_sline" ]] && continue
-        _stype="${_sline%% *}"
-        _srest="${_sline#* }"
-        if [[ "$_stype" == "FILE_RESULT" ]]; then
-            local _slbl _sstatus _sp _sf _se _ss _sxf _sxp _st
-            read -r _slbl _sstatus _sp _sf _se _ss _sxf _sxp _st <<< "$_srest"
-            _FILE_SUMMARY_LABELS+=("$_slbl")
-            _FILE_SUMMARY_STATUS+=("$_sstatus")
-            _FILE_SUMMARY_COUNTS+=("${_sp:-0} ${_sf:-0} ${_se:-0} ${_ss:-0} ${_sxf:-0} ${_sxp:-0} ${_st:-0}")
-        elif [[ "$_stype" == "FAILED_TEST" ]]; then
-            _ALL_FAILED_TESTS+=("$_srest")
+    # Check pytest-xdist is available before proceeding.
+    if ! python3 -m pytest --co -q --no-header -p xdist /dev/null &>/dev/null 2>&1; then
+        if ! python3 -c "import xdist" 2>/dev/null; then
+            echo "[torch_oot_device_tests_run] WARNING: pytest-xdist not installed — cannot use -n1 fallback." >&2
+            echo "[torch_oot_device_tests_run]          Install with: pip install pytest-xdist" >&2
+            echo "[torch_oot_device_tests_run]          Skipping remaining tests in: $_orig" >&2
+            [[ $OVERALL_EXIT -eq 0 ]] && OVERALL_EXIT=1
+            _FILE_SUMMARY_LABELS+=("$(basename "$_orig") [signal/no-xdist]")
+            _FILE_SUMMARY_STATUS+=("SIGNAL")
+            _FILE_SUMMARY_COUNTS+=("0 0 0 0 0 0 0")
+            return
         fi
-    done < "$_summary_file"
-
-    local _s
-    while IFS= read -r _s; do
-        [[ -n "$_s" ]] && _XML_SHARDS+=("$_s")
-    done < "$_shard_list_file"
-
-    if [[ ${#YAML_CONFIGS[@]} -ge 2 ]]; then
-        local _cline _clbl _cp _cf _ce _cs _cxf _cxp _ct
-        while IFS= read -r _cline; do
-            [[ -z "$_cline" ]] && continue
-            read -r _clbl _cp _cf _ce _cs _cxf _cxp _ct <<< "$_cline"
-            _add_suite_counts "$_clbl" "${_cp:-0}" "${_cf:-0}" "${_ce:-0}" "${_cs:-0}" "${_cxf:-0}" "${_cxp:-0}" "${_ct:-0}"
-        done < "$_counts_file"
     fi
-    rm -f "$_summary_file" "$_shard_list_file" "$_counts_file"
 
-    # Propagate the loop's outcome. As elsewhere, --mode=validate masks a
-    # test-failure-only result but never an error/signal result.
-    case $_loop_rc in
-        0) ;;
-        1) [[ "$_MODE" != "validate" ]] && { [[ $OVERALL_EXIT -eq 0 ]] && OVERALL_EXIT=1; } ;;
-        *) [[ $OVERALL_EXIT -eq 0 ]] && OVERALL_EXIT=1 ;;
-    esac
+    local _xdist_args=("-n1" "${_extra[@]+"${_extra[@]}"}")
+    [[ -n "$_shard_xml" ]] && _xdist_args+=("--junit-xml=${_shard_xml}")
+
+    # This retry re-runs on the SAME device that just killed pytest with a signal.
+    # When the cause is a wedged AIU card (VFIO/RAS stall) rather than a software
+    # crash, the re-run blocks on the device forever: no output, and on CI the
+    # /dev/vfio card stays locked for the whole outer job cap. Bound it so a dead
+    # card costs one shard instead of the pool. Override via OOT_FALLBACK_TIMEOUT
+    # (0 or "" disables); SIGKILL because a VFIO-blocked process ignores SIGTERM.
+    local _fb_timeout="${OOT_FALLBACK_TIMEOUT-15m}"
+    local _xdist_out_tmp="/tmp/_spyre_xdist_out_${$}_$$.tmp"
+    if [[ -n "$_fb_timeout" && "$_fb_timeout" != "0" ]] && command -v timeout >/dev/null 2>&1; then
+        echo "[torch_oot_device_tests_run]     Retry bounded to ${_fb_timeout} (wedged-device guard)."
+        # --foreground: this prefix wraps the calls above, so it needs the same fix or it reintroduces the escape one level up.
+        _OOT_TIMEOUT_PREFIX=("timeout" "--foreground" "--signal=KILL" "$_fb_timeout")
+    else
+        _OOT_TIMEOUT_PREFIX=()
+    fi
+    _wait_for_vfio_release "serial retry for $(basename "$_orig")"
+    _run_pytest_isolated "$_dir" "$_base" "$_exit_tmp" "$_xdist_out_tmp" "${_xdist_args[@]}"
+    _OOT_TIMEOUT_PREFIX=()
+
+    local _xexit=139
+    if [[ -f "$_exit_tmp" ]]; then
+        _xexit=$(< "$_exit_tmp")
+        rm -f "$_exit_tmp"
+    else
+        echo "[torch_oot_device_tests_run] WARNING: xdist fallback subshell exited abnormally for $_orig" >&2
+    fi
+
+    # Track per-file results and collect failed test names from xdist run.
+    _xdist_display="$(basename "$_orig")"
+    if [[ -f "$_xdist_out_tmp" ]]; then
+        read -r _sp _sf _se _ss _sxf _sxp _st <<< "$(_parse_pytest_summary_line "$_xdist_out_tmp")"
+        # Accumulate per-suite counts (multi-config).
+        if [[ ${#YAML_CONFIGS[@]} -ge 2 && -n "$_suite_lbl" ]]; then
+            _add_suite_counts "$_suite_lbl" "${_sp:-0}" "${_sf:-0}" "${_se:-0}" "${_ss:-0}" "${_sxf:-0}" "${_sxp:-0}" "${_st:-0}"
+        fi
+        # Record per-file result for end-of-run summary.
+        case $_xexit in
+            0) _xfstatus="PASS" ;;
+            1) _xfstatus="FAIL" ;;
+            5) _xfstatus="NOTEST" ;;
+            *) _xfstatus="SIGNAL" ;;
+        esac
+        _FILE_SUMMARY_LABELS+=("${_xdist_display} [xdist]")
+        _FILE_SUMMARY_STATUS+=("$_xfstatus")
+        _FILE_SUMMARY_COUNTS+=("${_sp:-0} ${_sf:-0} ${_se:-0} ${_ss:-0} ${_sxf:-0} ${_sxp:-0} ${_st:-0}")
+        # Collect failed test names.
+        while IFS= read -r _fn; do
+            [[ -n "$_fn" ]] && _ALL_FAILED_TESTS+=("$_fn")
+        done < <(_extract_failed_tests "$_xdist_out_tmp")
+    else
+        _FILE_SUMMARY_LABELS+=("${_xdist_display} [signal]")
+        _FILE_SUMMARY_STATUS+=("SIGNAL")
+        _FILE_SUMMARY_COUNTS+=("0 0 0 0 0 0 0")
+    fi
+    rm -f "$_xdist_out_tmp"
+
+    # Propagate test failures from the xdist fallback run. As above, in
+    # --mode=validate a test-failure exit (1) is recorded in the summary but
+    # does not fail the script; other non-zero exits are unaffected by mode.
+    if [[ $_xexit -eq 1 ]]; then
+        if [[ "$_MODE" != "validate" ]]; then
+            [[ $OVERALL_EXIT -eq 0 ]] && OVERALL_EXIT=1
+        fi
+    elif [[ $_xexit -ne 0 && $_xexit -ne 5 ]]; then
+        OVERALL_EXIT=$_xexit
+    fi
+
+    # Inject XML tags into the shard produced by the xdist run.
+    if [[ -n "$_shard_xml" && -f "$_shard_xml" ]]; then
+        python3 -c "$_XML_INJECT_PY" "$_shard_xml" "$YAML_CONFIG" || true
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -3177,31 +2800,80 @@ _run_parallel_across_cards() {
                         _card_overall=$_exit
                         break ;;
                     *)
-                        # Signal exit — recover with the same bounded, multi-round,
-                        # ID-level retry loop _run_xdist_fallback's serial path uses
-                        # (_run_signal_retry_loop), instead of a single-shot whole-
-                        # batch retry: it keeps retrying the still-unresolved subset
-                        # of this card's ids, escalating to single-test isolation if
-                        # a round makes zero progress, so one reliably-crashing test
-                        # can't take the rest of this card's slice down with it.
+                        # Signal exit — wait for the crashed process's VFIO handle to
+                        # release, then retry the card's slice with -n1 xdist (worker
+                        # isolation: a crash in one test doesn't lose the rest of the
+                        # slice). The retry's real outcome is always recorded below
+                        # (recovered counts or an honest zero), never silently dropped.
                         echo "[torch_oot_device_tests_run] WARNING: pytest exited with signal (code $_exit) on card ${_subshell_card}" >&2
-                        local _sigretry_counts_file=""
-                        [[ ${#YAML_CONFIGS[@]} -ge 2 ]] && _sigretry_counts_file="$_subshell_counts_file"
-                        local _sigretry_rc=0
-                        _run_signal_retry_loop "$run_dir" "$original_file" "$_shard_xml" \
-                            "$_subshell_summary_file" "$_subshell_shard_list" "$_sigretry_counts_file" \
-                            "${_FILE_YAML_LABEL[$_fidx]:-unknown}" \
-                            "${_EXTRA_NO_XML[@]+"${_EXTRA_NO_XML[@]}"}" -- "${_id_args[@]}" || _sigretry_rc=$?
-                        case $_sigretry_rc in
-                            0) ;;
-                            1)
-                                # Test failures only — masked in --mode=validate.
-                                if [[ "$_MODE" != "validate" ]]; then
-                                    [[ $_card_overall -eq 0 ]] && _card_overall=1
+                        if python3 -c "import xdist" 2>/dev/null; then
+                            _wait_for_vfio_release "card ${_subshell_card} (SPYRE_DEVICES=${_subshell_device_id}), $(basename "$original_file")"
+                            local -a _xdist_args=("-n1" "${_file_args[@]+"${_file_args[@]}"}")
+                            local _xdist_par_out="/tmp/_spyre_par_xdist_out_${$}_card${_subshell_card}_${_fidx}.tmp"
+                            # Bounded the same way _run_xdist_fallback's serial-path retry
+                            # is: this re-runs on the SAME device that just killed pytest
+                            # with a signal, so a wedged card would otherwise block this
+                            # subshell (and this card's whole remaining file queue) forever.
+                            local _fb_timeout="${OOT_FALLBACK_TIMEOUT-15m}"
+                            local -a _par_retry_tmo=()
+                            if [[ -n "$_fb_timeout" && "$_fb_timeout" != "0" ]] && command -v timeout >/dev/null 2>&1; then
+                                _par_retry_tmo=("timeout" "--foreground" "--signal=KILL" "$_fb_timeout")
+                            fi
+                            (
+                                set +euo pipefail
+                                cd "$run_dir"
+                                "${_par_retry_tmo[@]+"${_par_retry_tmo[@]}"}" python3 -m pytest "${_id_args[@]}" "${_xdist_args[@]}" 2>&1 | tee "$_xdist_par_out"
+                                echo "${PIPESTATUS[0]}" > "$_exit_tmp"
+                            ) || true
+                            if [[ -f "$_exit_tmp" ]]; then
+                                local _xexit; _xexit=$(< "$_exit_tmp"); rm -f "$_exit_tmp"
+                                if [[ $_xexit -eq 1 ]]; then
+                                    # Test failure on retry — masked in --mode=validate.
+                                    if [[ "$_MODE" != "validate" ]]; then
+                                        [[ $_card_overall -eq 0 ]] && _card_overall=1
+                                    fi
+                                elif [[ $_xexit -ne 0 && $_xexit -ne 5 ]]; then
+                                    [[ $_card_overall -eq 0 ]] && _card_overall=$_xexit
                                 fi
-                                ;;
-                            *) [[ $_card_overall -eq 0 ]] && _card_overall=1 ;;
-                        esac
+                                if [[ -n "$_shard_xml" && -f "$_shard_xml" ]]; then
+                                    python3 -c "$_XML_INJECT_PY" "$_shard_xml" "$YAML_CONFIG" || true
+                                fi
+                                # Record the retry's real outcome so recovered counts reach
+                                # Totals. A distinctly-suffixed label (not a bracketed one --
+                                # FILE_RESULT lines are space-delimited and parsed with `read`)
+                                # sums into _FILE_SUMMARY_COUNTS via the existing aggregation
+                                # without disturbing the SIGNAL/FAIL/PASS merge-priority logic
+                                # for the original (unsuffixed) label.
+                                if [[ -f "$_xdist_par_out" ]]; then
+                                    read -r _sp _sf _se _ss _sxf _sxp _st <<< "$(_parse_pytest_summary_line "$_xdist_par_out")"
+                                    case $_xexit in
+                                        0) _pfxstatus="PASS" ;;
+                                        1) _pfxstatus="FAIL" ;;
+                                        5) _pfxstatus="NOTEST" ;;
+                                        *) _pfxstatus="SIGNAL" ;;
+                                    esac
+                                    echo "FILE_RESULT ${_p_file_display}__xdist_retry ${_pfxstatus} ${_sp:-0} ${_sf:-0} ${_se:-0} ${_ss:-0} ${_sxf:-0} ${_sxp:-0} ${_st:-0}" >> "$_subshell_summary_file"
+                                    while IFS= read -r _pfn; do
+                                        [[ -n "$_pfn" ]] && echo "FAILED_TEST ${_pfn}" >> "$_subshell_summary_file"
+                                    done < <(_extract_failed_tests "$_xdist_par_out")
+                                    # Suite-level accumulation stays a separate, still-gated
+                                    # concern (feeds _SUITE_COUNTS, not _FILE_SUMMARY_COUNTS/Totals).
+                                    if [[ ${#YAML_CONFIGS[@]} -ge 2 ]]; then
+                                        _p_suite_label="${_FILE_YAML_LABEL[$_fidx]:-unknown}"
+                                        echo "${_p_suite_label} ${_sp:-0} ${_sf:-0} ${_se:-0} ${_ss:-0} ${_sxf:-0} ${_sxp:-0} ${_st:-0}" >> "$_subshell_counts_file"
+                                    fi
+                                else
+                                    echo "FILE_RESULT ${_p_file_display}__signal SIGNAL 0 0 0 0 0 0 0" >> "$_subshell_summary_file"
+                                fi
+                            else
+                                echo "FILE_RESULT ${_p_file_display}__signal SIGNAL 0 0 0 0 0 0 0" >> "$_subshell_summary_file"
+                            fi
+                            rm -f "$_xdist_par_out"
+                        else
+                            echo "[torch_oot_device_tests_run] WARNING: pytest-xdist not installed — skipping xdist fallback for card ${_subshell_card}." >&2
+                            echo "FILE_RESULT ${_p_file_display}__signal_no_xdist SIGNAL 0 0 0 0 0 0 0" >> "$_subshell_summary_file"
+                            [[ $_card_overall -eq 0 ]] && _card_overall=1
+                        fi
                         ;;
                 esac
             done
