@@ -1002,6 +1002,17 @@ analyze(sys.argv[1])
 WRAPPER_FILES=()
 
 _cleanup_wrappers() {
+    # Debug escape hatch: leave generated wrapper/conftest files in place for
+    # manual inspection (e.g. reproducing a collection mismatch by hand
+    # against the exact file pytest actually saw) instead of deleting them
+    # on exit.
+    if [[ -n "${OOT_KEEP_WRAPPERS:-}" ]]; then
+        echo "[torch_oot_device_tests_run] OOT_KEEP_WRAPPERS set -- leaving generated wrapper(s) on disk:"
+        for wf in "${WRAPPER_FILES[@]+"${WRAPPER_FILES[@]}"}"; do
+            [[ -f "$wf" ]] && echo "[torch_oot_device_tests_run]   $wf"
+        done
+        return
+    fi
     for wf in "${WRAPPER_FILES[@]+"${WRAPPER_FILES[@]}"}"; do
         [[ -f "$wf" ]] && rm -f "$wf" && \
             echo "[torch_oot_device_tests_run] Cleaned up wrapper: $wf"
