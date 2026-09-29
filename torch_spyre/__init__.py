@@ -24,7 +24,9 @@ from . import memory
 from . import profiler
 
 
-_runtime_init_lock = threading.Lock()
+# RLock: _lazy_init() calls _prepare_c_extension() while already holding
+# this lock, so it must be safe for the same thread to reacquire it.
+_runtime_init_lock = threading.RLock()
 
 
 class _SpyreImpl:

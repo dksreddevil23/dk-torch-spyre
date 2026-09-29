@@ -158,6 +158,70 @@ class TestSpyre(TestCase):
         )
         assert out.endswith("OK"), f"unexpected stdout:\n{out}\nstderr:\n{err}"
 
+    def test_lazy_init_without_prior_prepare_does_not_deadlock(self):
+        """_lazy_init() must not deadlock when it is the first call to touch
+        the runtime in a process.
+
+        _lazy_init() holds _runtime_init_lock and, from within that critical
+        section, calls _prepare_c_extension() -- which normally short-circuits
+        immediately because manual_seed()/manual_seed_all() (called by
+        torch.testing._internal.common_utils at import time) already ran
+        _prepare_c_extension() first and populated self._C. But a process
+        that never calls any RNG method before its first real device op --
+        e.g. a freshly spawned Inductor compile-worker subprocess, which
+        does not re-import common_utils -- hits _lazy_init() as the very
+        first caller, with self._C still None. If _runtime_init_lock were a
+        plain (non-reentrant) Lock, _prepare_c_extension()'s own `with
+        _runtime_init_lock:` would then block forever on the lock
+        _lazy_init() is still holding. Uses a short timeout so a regression
+        fails fast instead of hanging the whole test run.
+        """
+        import sys
+        import subprocess
+        import textwrap
+
+        script = textwrap.dedent("""
+            import torch
+            import torch_spyre  # noqa: F401
+
+            # Call _lazy_init() directly, with nothing having called
+            # manual_seed()/_prepare_c_extension() first in this process --
+            # reproducing the fresh compile-worker-subprocess ordering.
+            torch.spyre._impl._lazy_init()
+
+            assert torch.spyre.is_initialized() is True, (
+                "runtime did not report initialized after _lazy_init()"
+            )
+
+            print("OK")
+        """)
+
+        env = os.environ.copy()
+        env["DT_DEEPRT_VERBOSE"] = "-1"
+        env["DTLOG_LEVEL"] = "error"
+
+        try:
+            proc = subprocess.run(
+                [sys.executable, "-c", script],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=env,
+                timeout=60,
+                text=True,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise AssertionError(
+                "_lazy_init() deadlocked (timed out) when called without a "
+                "prior _prepare_c_extension() call -- check "
+                "_runtime_init_lock reentrancy"
+            ) from e
+        out = (proc.stdout or "").strip()
+        err = (proc.stderr or "").strip()
+        assert proc.returncode == 0, (
+            f"subprocess failed (rc={proc.returncode}).\nstdout:\n{out}\nstderr:\n{err}"
+        )
+        assert out.endswith("OK"), f"unexpected stdout:\n{out}\nstderr:\n{err}"
+
 
 if __name__ == "__main__":
     run_tests()
