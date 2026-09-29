@@ -784,19 +784,26 @@ def _build_fp32_proxy_cpu_refs(
     groups); tensor entries are upcast to fp32 too, non-tensor entries pass
     through as-is.
 
-    Gate on arch + ``_is_test_large_matmul_fp32_proxy_shape`` before calling.
+    Gate on arch + the applicable ``_is_test_*_fp32_proxy_shape`` allow-list
+    before calling.
 
-    Proxy gold for CI wall-time under ``test_mm_relaxed`` tolerances, not fp16-CPU
-    parity vs x86.
+    Proxy reference to reduce CI wall-time; validated under the calling test's
+    tolerances, not for FP16-CPU parity vs x86.
     """
 
     def op_fp32_proxy(a, b, *extra_args):
-        extra32 = (t.float() if isinstance(t, torch.Tensor) else t for t in extra_args)
+        extra32 = tuple(
+            t.float() if isinstance(t, torch.Tensor) else t for t in extra_args
+        )
         return op(a.float(), b.float(), *extra32).to(dtype=a.dtype)
 
     kwargs = {}
     with torch.no_grad():
         if wrap is None:
+            assert not extra_args, (
+                "wrap=None does not forward extra_args; pass wrap= for ops "
+                "with extra positional args (e.g. conv2d)."
+            )
             a32, b32 = a.float(), b.float()
             kwargs["cpu_eager_result"] = op(a32, b32).to(dtype=a.dtype)
             if bool(os.getenv("TEST_COMPARE_CPU_COMPILE")):
