@@ -1659,7 +1659,7 @@ _add_suite_counts() {
 # ---------------------------------------------------------------------------
 # Per-file result tracking — always collected (not just multi-config).
 # _FILE_SUMMARY_LABELS[i]  : display name (basename of original test file)
-# _FILE_SUMMARY_STATUS[i]  : PASS | FAIL | SIGNAL | NOTEST | ERROR | COLLECTFAIL
+# _FILE_SUMMARY_STATUS[i]  : PASS | FAIL | SIGNAL | NOTEST | ERROR
 # _FILE_SUMMARY_COUNTS[i]  : "passed failed error skipped xfailed xpassed time"
 # _ALL_FAILED_TESTS[]      : accumulated failed test node IDs, one per entry
 # ---------------------------------------------------------------------------
@@ -1912,62 +1912,6 @@ _run_pytest_isolated() {
 }
 
 # ---------------------------------------------------------------------------
-# _vfio_holder_pids
-#
-# Prints PIDs (with comm names) currently holding an open /dev/vfio/* fd,
-# excluding this shell itself. Ported from the equivalent helper in
-# .github/actions/run-test-suite/action.yml, which uses this same /proc scan
-# to avoid retrying onto a card whose fd a just-killed process hasn't
-# released yet.
-# ---------------------------------------------------------------------------
-_vfio_holder_pids() {
-    local pid comm found=""
-    for fd_dir in /proc/[0-9]*/fd; do
-        pid="${fd_dir#/proc/}"; pid="${pid%/fd}"
-        [[ "$pid" == "$$" ]] && continue
-        if ls -l "$fd_dir" 2>/dev/null | grep -qE '/dev/vfio/[0-9]+'; then
-            comm="$(cat "/proc/$pid/comm" 2>/dev/null || echo '?')"
-            found="${found}${found:+ }${pid}(${comm})"
-        fi
-    done
-    printf '%s' "$found"
-}
-
-# ---------------------------------------------------------------------------
-# _wait_for_vfio_release <log_label>
-#
-# A killed VFIO-holding process does not release its fd synchronously (it
-# can stay in D-state inside a driver ioctl). Retrying on the same physical
-# card while its fd is still held is guaranteed to fail with
-# RAS::VFIO::DeviceOpenFail. Polls _vfio_holder_pids every 2s up to
-# OOT_CARD_RELEASE_TIMEOUT_SECS (default 60s, matching the CI-level
-# action.yml wrapper's default), then force-kills any straggler PID before
-# returning. Called before every signal-retry in this script (both the
-# serial _run_xdist_fallback below and _run_parallel_across_cards's per-card
-# retry) so a wedged device is never immediately re-opened.
-# ---------------------------------------------------------------------------
-_wait_for_vfio_release() {
-    local _label="$1"
-    local _timeout="${OOT_CARD_RELEASE_TIMEOUT_SECS:-60}"
-    local _waited=0 _holders
-    while [[ $_waited -lt $_timeout ]]; do
-        _holders="$(_vfio_holder_pids)"
-        [[ -z "$_holders" ]] && return 0
-        [[ $_waited -eq 0 ]] && echo "[torch_oot_device_tests_run] Waiting for AIU card release before retry (${_label}); held by PID(s): ${_holders}" >&2
-        sleep 2
-        _waited=$(( _waited + 2 ))
-    done
-    _holders="$(_vfio_holder_pids)"
-    if [[ -n "$_holders" ]]; then
-        echo "[torch_oot_device_tests_run] WARNING: AIU card still held by PID(s) ${_holders} after ${_timeout}s (${_label}) -- force-killing before retry." >&2
-        for _holder in $_holders; do
-            kill -KILL "${_holder%%(*}" 2>/dev/null || true
-        done
-        sleep 2
-    fi
-}
-
-# ---------------------------------------------------------------------------
 # _run_xdist_fallback <run_dir> <run_basename> <original_file>
 #                     <exit_tmp> <shard_xml> [pytest_args...]
 #
@@ -2043,7 +1987,6 @@ _run_xdist_fallback() {
     else
         _OOT_TIMEOUT_PREFIX=()
     fi
-    _wait_for_vfio_release "serial retry for $(basename "$_orig")"
     _run_pytest_isolated "$_dir" "$_base" "$_exit_tmp" "$_xdist_out_tmp" "${_xdist_args[@]}"
     _OOT_TIMEOUT_PREFIX=()
 
@@ -2177,22 +2120,8 @@ except Exception as e:
 #
 # Collection uses `pytest --collect-only -q` run from the file's directory
 # so conftest.py and SPYRE_TEST_FILE / OOT_TEST_FILE are set up identically
-# to a real run.  Collection is done without touching SPYRE_DEVICES at all
-# (so torch.spyre.device_count() keeps reporting the true visible-device
-# total for every probe, e.g. for a class-body @skipUnless(device_count() >
-# 1, ...)). Instead, each concurrently-running collect-only probe (both fan-
-# out phases below) is handed a distinct LOCAL_RANK from a FIFO-backed
-# semaphore (fd 9, set up just below): if a probe's test file
-# touches the device at import/class-definition time -- e.g. a module/class-
-# body torch.manual_seed() -- torch_spyre's C++ runtime opens
-# logical_device_id=LOCAL_RANK (torch_spyre/csrc/module.cpp), so two
-# concurrently-running probes always end up opening two different visible
-# devices instead of racing over the same un-pinned one (LOCAL_RANK unset
-# defaults to 0 for all of them, which is the actual root cause of the
-# collection-time RAS::VFIO::DeviceOpenFail this avoids). The semaphore uses
-# a fixed fd (9), not the `exec {var}<>file` dynamic-fd syntax: that syntax
-# needs bash 4.1+, whereas plain numbered-fd redirection works on any bash
-# this script already requires (it uses `declare -A`, bash 4.0+).
+# to a real run.  Collection is done without SPYRE_DEVICES so the runtime
+# is not loaded.
 #
 # Globals read:   RUN_FILES TEST_FILES _EXTRA_NO_XML _FINAL_XML_PATH
 #                 YAML_CONFIG _XML_INJECT_PY
@@ -2218,26 +2147,6 @@ _run_parallel_across_cards() {
     # confirm the fan-out speedup empirically. SECONDS is a bash builtin
     # (seconds since shell start) — no external `date` dependency.
     local _collect_start=$SECONDS
-
-    # -----------------------------------------------------------------------
-    # Rank semaphore for the collection phase (see the function doc comment
-    # above). Tokens are the ranks 0.._n_cards-1, not physical device ids --
-    # exactly the range torch_spyre's C++ runtime accepts for LOCAL_RANK
-    # (checked against the true visible-device count, which _n_cards is
-    # derived from). A probe blocks on `read` until a rank is free, exports
-    # it as LOCAL_RANK for its own lifetime, and returns it via an EXIT trap.
-    # This is independent of, and layered on top of, the existing fork-count
-    # throttle below: that throttle still bounds how many probe subshells
-    # get forked at once, while this semaphore only guarantees that whichever
-    # ones are currently running never share a rank.
-    # -----------------------------------------------------------------------
-    local _collect_sem_fifo="/tmp/_spyre_collect_sem_${$}"
-    mkfifo "$_collect_sem_fifo"
-    exec 9<>"$_collect_sem_fifo"
-    rm -f "$_collect_sem_fifo"
-    for (( _r=0; _r<_n_cards; _r++ )); do
-        echo "$_r" >&9
-    done
 
     # -----------------------------------------------------------------------
     # Step 1: collect all test node IDs across every resolved file.
@@ -2314,11 +2223,6 @@ _run_parallel_across_cards() {
         (
             # A 0-match --collect-only (or a killed probe) is expected/handled below, not a script-ending error.
             set +euo pipefail
-            # Acquire this probe's rank from the semaphore set up above and
-            # return it on any exit path (see the function doc comment).
-            IFS= read -r -u 9 _my_rank
-            trap 'echo "$_my_rank" >&9' EXIT
-            export LOCAL_RANK="$_my_rank"
             export SPYRE_TEST_FILE="$_rf"
             export OOT_TEST_FILE="$_rf"
             # Give this probe its own Inductor cache dir so concurrent collect-only imports
@@ -2430,10 +2334,6 @@ _run_parallel_across_cards() {
             _retry_exit_files[$i]="$_rexit"
             (
                 set +euo pipefail
-                # See the matching rank acquisition in the initial collection fan-out above.
-                IFS= read -r -u 9 _my_rank
-                trap 'echo "$_my_rank" >&9' EXIT
-                export LOCAL_RANK="$_my_rank"
                 export SPYRE_TEST_FILE="$_rf2"
                 export OOT_TEST_FILE="$_rf2"
                 # A dedicated cache dir for the retry too, so it can't collide with whatever else is still running.
@@ -2512,16 +2412,6 @@ _run_parallel_across_cards() {
                 fi
             fi
             rm -f "$_cerr" "$_cexit"
-            # Record this as a visible failure rather than letting the file vanish
-            # from the run with no trace: _FILE_SUMMARY_* are global arrays, so
-            # appending here (main function body, not a background subshell) is
-            # safe without any temp-file plumbing.
-            _FILE_SUMMARY_LABELS+=("$(basename "$_of")")
-            _FILE_SUMMARY_STATUS+=("COLLECTFAIL")
-            _FILE_SUMMARY_COUNTS+=("0 0 0 0 0 0 0")
-            if [[ "$_MODE" != "validate" ]]; then
-                [[ $OVERALL_EXIT -eq 0 ]] && OVERALL_EXIT=1
-            fi
             continue
         fi
         rm -f "$_cerr" "$_cexit"
@@ -2548,9 +2438,6 @@ _run_parallel_across_cards() {
     local _collect_elapsed=$(( SECONDS - _collect_start ))
     # Report against the actual candidate set rather than every resolved file, now that distributed files are routed elsewhere.
     echo "[torch_oot_device_tests_run_parallel] Collection phase completed in ${_collect_elapsed}s (${#_target_idx[@]} file(s), up to ${_n_cards} concurrent probe(s))."
-
-    # Collection is done -- close the rank semaphore fd set up before Step 1.
-    exec 9<&-
 
     local _total="${#_all_node_ids[@]}"
     if [[ $_total -eq 0 ]]; then
@@ -2769,11 +2656,9 @@ _run_parallel_across_cards() {
                     while IFS= read -r _pfn; do
                         [[ -n "$_pfn" ]] && echo "FAILED_TEST ${_pfn}" >> "$_subshell_summary_file"
                     done < <(_extract_failed_tests "$_par_out_tmp")
+                elif [[ $_exit -ge 128 ]]; then
+                    echo "FILE_RESULT ${_p_file_display} SIGNAL 0 0 0 0 0 0 0" >> "$_subshell_summary_file"
                 fi
-                # A signal exit ($_exit -ge 128) intentionally records nothing here --
-                # the case arm below retries it and records the real (recovered or
-                # honestly-zero) outcome instead of locking in an all-zero count
-                # before the retry even runs.
                 rm -f "$_par_out_tmp"
 
                 # XML tag injection for clean runs.
@@ -2800,29 +2685,15 @@ _run_parallel_across_cards() {
                         _card_overall=$_exit
                         break ;;
                     *)
-                        # Signal exit — wait for the crashed process's VFIO handle to
-                        # release, then retry the card's slice with -n1 xdist (worker
-                        # isolation: a crash in one test doesn't lose the rest of the
-                        # slice). The retry's real outcome is always recorded below
-                        # (recovered counts or an honest zero), never silently dropped.
+                        # Signal exit — retry the card's slice with -n1 xdist.
                         echo "[torch_oot_device_tests_run] WARNING: pytest exited with signal (code $_exit) on card ${_subshell_card}" >&2
                         if python3 -c "import xdist" 2>/dev/null; then
-                            _wait_for_vfio_release "card ${_subshell_card} (SPYRE_DEVICES=${_subshell_device_id}), $(basename "$original_file")"
                             local -a _xdist_args=("-n1" "${_file_args[@]+"${_file_args[@]}"}")
                             local _xdist_par_out="/tmp/_spyre_par_xdist_out_${$}_card${_subshell_card}_${_fidx}.tmp"
-                            # Bounded the same way _run_xdist_fallback's serial-path retry
-                            # is: this re-runs on the SAME device that just killed pytest
-                            # with a signal, so a wedged card would otherwise block this
-                            # subshell (and this card's whole remaining file queue) forever.
-                            local _fb_timeout="${OOT_FALLBACK_TIMEOUT-15m}"
-                            local -a _par_retry_tmo=()
-                            if [[ -n "$_fb_timeout" && "$_fb_timeout" != "0" ]] && command -v timeout >/dev/null 2>&1; then
-                                _par_retry_tmo=("timeout" "--foreground" "--signal=KILL" "$_fb_timeout")
-                            fi
                             (
                                 set +euo pipefail
                                 cd "$run_dir"
-                                "${_par_retry_tmo[@]+"${_par_retry_tmo[@]}"}" python3 -m pytest "${_id_args[@]}" "${_xdist_args[@]}" 2>&1 | tee "$_xdist_par_out"
+                                python3 -m pytest "${_id_args[@]}" "${_xdist_args[@]}" 2>&1 | tee "$_xdist_par_out"
                                 echo "${PIPESTATUS[0]}" > "$_exit_tmp"
                             ) || true
                             if [[ -f "$_exit_tmp" ]]; then
@@ -2838,40 +2709,16 @@ _run_parallel_across_cards() {
                                 if [[ -n "$_shard_xml" && -f "$_shard_xml" ]]; then
                                     python3 -c "$_XML_INJECT_PY" "$_shard_xml" "$YAML_CONFIG" || true
                                 fi
-                                # Record the retry's real outcome so recovered counts reach
-                                # Totals. A distinctly-suffixed label (not a bracketed one --
-                                # FILE_RESULT lines are space-delimited and parsed with `read`)
-                                # sums into _FILE_SUMMARY_COUNTS via the existing aggregation
-                                # without disturbing the SIGNAL/FAIL/PASS merge-priority logic
-                                # for the original (unsuffixed) label.
-                                if [[ -f "$_xdist_par_out" ]]; then
+                                # Accumulate counts from xdist retry output.
+                                if [[ ${#YAML_CONFIGS[@]} -ge 2 && -f "$_xdist_par_out" ]]; then
+                                    _p_suite_label="${_FILE_YAML_LABEL[$_fidx]:-unknown}"
                                     read -r _sp _sf _se _ss _sxf _sxp _st <<< "$(_parse_pytest_summary_line "$_xdist_par_out")"
-                                    case $_xexit in
-                                        0) _pfxstatus="PASS" ;;
-                                        1) _pfxstatus="FAIL" ;;
-                                        5) _pfxstatus="NOTEST" ;;
-                                        *) _pfxstatus="SIGNAL" ;;
-                                    esac
-                                    echo "FILE_RESULT ${_p_file_display}__xdist_retry ${_pfxstatus} ${_sp:-0} ${_sf:-0} ${_se:-0} ${_ss:-0} ${_sxf:-0} ${_sxp:-0} ${_st:-0}" >> "$_subshell_summary_file"
-                                    while IFS= read -r _pfn; do
-                                        [[ -n "$_pfn" ]] && echo "FAILED_TEST ${_pfn}" >> "$_subshell_summary_file"
-                                    done < <(_extract_failed_tests "$_xdist_par_out")
-                                    # Suite-level accumulation stays a separate, still-gated
-                                    # concern (feeds _SUITE_COUNTS, not _FILE_SUMMARY_COUNTS/Totals).
-                                    if [[ ${#YAML_CONFIGS[@]} -ge 2 ]]; then
-                                        _p_suite_label="${_FILE_YAML_LABEL[$_fidx]:-unknown}"
-                                        echo "${_p_suite_label} ${_sp:-0} ${_sf:-0} ${_se:-0} ${_ss:-0} ${_sxf:-0} ${_sxp:-0} ${_st:-0}" >> "$_subshell_counts_file"
-                                    fi
-                                else
-                                    echo "FILE_RESULT ${_p_file_display}__signal SIGNAL 0 0 0 0 0 0 0" >> "$_subshell_summary_file"
+                                    echo "${_p_suite_label} ${_sp:-0} ${_sf:-0} ${_se:-0} ${_ss:-0} ${_sxf:-0} ${_sxp:-0} ${_st:-0}" >> "$_subshell_counts_file"
                                 fi
-                            else
-                                echo "FILE_RESULT ${_p_file_display}__signal SIGNAL 0 0 0 0 0 0 0" >> "$_subshell_summary_file"
                             fi
                             rm -f "$_xdist_par_out"
                         else
                             echo "[torch_oot_device_tests_run] WARNING: pytest-xdist not installed — skipping xdist fallback for card ${_subshell_card}." >&2
-                            echo "FILE_RESULT ${_p_file_display}__signal_no_xdist SIGNAL 0 0 0 0 0 0 0" >> "$_subshell_summary_file"
                             [[ $_card_overall -eq 0 ]] && _card_overall=1
                         fi
                         ;;
@@ -3344,10 +3191,9 @@ else
         [[ "${_fxp:-0}" -gt 0 ]] && _fparts+=("${_fxp} xpassed")
         if [[ ${#_fparts[@]} -eq 0 ]]; then
             case "$_fstat" in
-                NOTEST)      _fsummary="no tests collected" ;;
-                SIGNAL)      _fsummary="signal/crash (see above)" ;;
-                COLLECTFAIL) _fsummary="collection failed after retries (see above)" ;;
-                *)           _fsummary="0 tests" ;;
+                NOTEST) _fsummary="no tests collected" ;;
+                SIGNAL) _fsummary="signal/crash (see above)" ;;
+                *)      _fsummary="0 tests" ;;
             esac
         else
             _fsummary="$(IFS=', '; echo "${_fparts[*]}")"
