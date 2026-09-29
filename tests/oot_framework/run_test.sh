@@ -2476,6 +2476,27 @@ _run_parallel_across_cards() {
     echo "[torch_oot_device_tests_run]   total test IDs collected: ${_total}"
     echo ""
 
+    # Temporary diagnostic: set OOT_DEBUG_TESTID to a substring (e.g. a test
+    # method name) to trace whether Step 1's global collect-only found it,
+    # and under what env, so a Step-3 "not found" for the same ID can be
+    # compared against Step 1's actual real environment instead of a
+    # manually-reconstructed guess at it.
+    if [[ -n "${OOT_DEBUG_TESTID:-}" ]]; then
+        echo "[torch_oot_debug] ---- OOT_DEBUG_TESTID=${OOT_DEBUG_TESTID} (Step 1: global collect-only) ----" >&2
+        echo "[torch_oot_debug] PYTORCH_TEST_CONFIG=${PYTORCH_TEST_CONFIG:-<unset>}" >&2
+        echo "[torch_oot_debug] PYTORCH_TESTING_DEVICE_ONLY_FOR=${PYTORCH_TESTING_DEVICE_ONLY_FOR:-<unset>}" >&2
+        echo "[torch_oot_debug] SPYRE_DEVICES=${SPYRE_DEVICES:-<unset>}" >&2
+        local _dbg_hit=0
+        for _dbg_id in "${_all_node_ids[@]}"; do
+            if [[ "$_dbg_id" == *"${OOT_DEBUG_TESTID}"* ]]; then
+                echo "[torch_oot_debug] FOUND in Step 1's global list: ${_dbg_id}" >&2
+                _dbg_hit=1
+            fi
+        done
+        [[ $_dbg_hit -eq 0 ]] && echo "[torch_oot_debug] NOT found anywhere in Step 1's global list (${_total} ids)." >&2
+        echo "[torch_oot_debug] --------------------------------------------------------------" >&2
+    fi
+
     # -----------------------------------------------------------------------
     # Step 2: distribute node IDs round-robin across cards.
     #
@@ -2646,6 +2667,29 @@ _run_parallel_across_cards() {
 
                 export SPYRE_TEST_FILE="$run_file"
                 export OOT_TEST_FILE="$run_file"
+
+                # Temporary diagnostic: matches the Step-1 block above. Runs a
+                # throwaway --collect-only under this card's *actual* real
+                # environment (SPYRE_DEVICES, PYTORCH_TEST_CONFIG, etc. are
+                # already exported above/by the caller at this point) to see
+                # whether the target ID exists here at all, before the real
+                # run below decides pass/fail on it.
+                if [[ -n "${OOT_DEBUG_TESTID:-}" ]]; then
+                    echo "[torch_oot_debug] ---- OOT_DEBUG_TESTID=${OOT_DEBUG_TESTID} (card ${_subshell_card}: per-card real env) ----" >&2
+                    echo "[torch_oot_debug] PYTORCH_TEST_CONFIG=${PYTORCH_TEST_CONFIG:-<unset>}" >&2
+                    echo "[torch_oot_debug] PYTORCH_TESTING_DEVICE_ONLY_FOR=${PYTORCH_TESTING_DEVICE_ONLY_FOR:-<unset>}" >&2
+                    echo "[torch_oot_debug] SPYRE_DEVICES=${SPYRE_DEVICES:-<unset>}" >&2
+                    local _dbg_out
+                    _dbg_out="$(cd "$run_dir" && python3 -m pytest "$run_basename" \
+                        --collect-only -q --no-header -p no:cacheprovider 2>/dev/null \
+                        | grep "${OOT_DEBUG_TESTID}")"
+                    if [[ -n "$_dbg_out" ]]; then
+                        echo "[torch_oot_debug] FOUND under this card's real env: ${_dbg_out}" >&2
+                    else
+                        echo "[torch_oot_debug] NOT found under this card's real env." >&2
+                    fi
+                    echo "[torch_oot_debug] --------------------------------------------------------------" >&2
+                fi
 
                 local _exit_tmp="/tmp/_spyre_pytest_exit_${$}_card${_subshell_card}_${_fidx}.tmp"
 
