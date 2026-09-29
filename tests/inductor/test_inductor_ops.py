@@ -776,13 +776,15 @@ def _build_fp32_proxy_cpu_refs(
     Skips live fp16 CPU work that is extremely slow on s390x/ppc64. Spyre still
     runs on the original tensors.
 
-    When ``wrap`` is None (TestOps), ``cpu_eager_result`` is ``op(a32, b32)``.
-    When ``wrap`` is set (LX planning), ``cpu_eager_result`` is
-    ``wrap(op_fp32_proxy)(a, b, *extra_args)`` to match
-    ``compare_with_cpu(wrap(op), ...)``. ``extra_args`` are additional
-    positional args beyond ``a``/``b`` (e.g. conv2d's bias, padding, stride,
-    groups); tensor entries are upcast to fp32 too, non-tensor entries pass
-    through as-is.
+    ``extra_args`` are additional positional args beyond ``a``/``b`` (e.g.
+    conv2d's bias, padding, stride, groups); tensor entries are upcast to
+    fp32 too, non-tensor entries pass through as-is. Forwarded in both
+    branches below.
+
+    When ``wrap`` is None (TestOps), ``cpu_eager_result`` is
+    ``op_fp32_proxy(a, b, *extra_args)``. When ``wrap`` is set (LX planning),
+    ``cpu_eager_result`` is ``wrap(op_fp32_proxy)(a, b, *extra_args)`` to
+    match ``compare_with_cpu(wrap(op), ...)``.
 
     Gate on arch + the applicable ``_is_test_*_fp32_proxy_shape`` allow-list
     before calling.
@@ -791,23 +793,23 @@ def _build_fp32_proxy_cpu_refs(
     tolerances, not for FP16-CPU parity vs x86.
     """
 
-    def op_fp32_proxy(a, b, *extra_args):
-        extra32 = tuple(
+    def upcast(extra_args):
+        return tuple(
             t.float() if isinstance(t, torch.Tensor) else t for t in extra_args
         )
-        return op(a.float(), b.float(), *extra32).to(dtype=a.dtype)
+
+    def op_fp32_proxy(a, b, *extra_args):
+        return op(a.float(), b.float(), *upcast(extra_args)).to(dtype=a.dtype)
 
     kwargs = {}
     with torch.no_grad():
         if wrap is None:
-            assert not extra_args, (
-                "wrap=None does not forward extra_args; pass wrap= for ops "
-                "with extra positional args (e.g. conv2d)."
-            )
-            a32, b32 = a.float(), b.float()
-            kwargs["cpu_eager_result"] = op(a32, b32).to(dtype=a.dtype)
+            kwargs["cpu_eager_result"] = op_fp32_proxy(a, b, *extra_args)
             if bool(os.getenv("TEST_COMPARE_CPU_COMPILE")):
-                out32 = _compile_and_run(op, (a32, b32), "cpu", compile=True)
+                a32, b32 = a.float(), b.float()
+                out32 = _compile_and_run(
+                    op, (a32, b32, *upcast(extra_args)), "cpu", compile=True
+                )
                 kwargs["cpu_compile_result"] = out32.to(dtype=a.dtype)
         else:
             kwargs["cpu_eager_result"] = wrap(op_fp32_proxy)(a, b, *extra_args)
@@ -8755,6 +8757,22 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 x, weight, bias, stride=stride, padding=padding, groups=groups
             )
 
+        kwargs = {}
+        # Large conv2d on s390x/ppc64: live fp16 CPU im2col-equivalent GEMM is
+        # extremely slow (no optimized fp16 BLAS). Use fp32->fp16 CPU refs for
+        # allow-listed shapes only (see _is_test_conv2d_fp32_proxy_shape);
+        # Spyre still executes on the original fp16 inputs. Skip when
+        # compare_with_cpu is overridden (e.g. LX planning wraps fn with a
+        # second op); that path builds its own proxy ref via wrap=.
+        if (
+            type(self).compare_with_cpu is TestOps.compare_with_cpu
+            and _arch_needs_fp32_proxy_cpu_ref()
+            and _is_test_conv2d_fp32_proxy_shape(x, weight)
+        ):
+            kwargs.update(
+                _build_fp32_proxy_cpu_refs(fn, x, weight, bias, padding, stride, groups)
+            )
+
         self.compare_with_cpu(
             fn,
             x,
@@ -8765,6 +8783,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             groups,
             atol=0.5,
             rtol=0.1,
+            **kwargs,
         )
 
     def test_conv2d_direct_base(self, x, weight, bias, stride):
