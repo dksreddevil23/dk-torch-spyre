@@ -2143,6 +2143,29 @@ _run_parallel_across_cards() {
     local _collect_start=$SECONDS
 
     # -----------------------------------------------------------------------
+    # Collection-phase hardware lock.
+    #
+    # instantiate_device_type_tests() (called at module scope by upstream
+    # PyTorch test files) invokes get_all_devices() -> device_mod.device_count()
+    # -> _C.device_count() during IMPORT, i.e. during `--collect-only` -- even
+    # though SPYRE_DEVICES is deliberately left unset for collection below.
+    # That call reaches real hardware. Two such probes running at once --
+    # whether both are this function's own fan-out, or one belongs to a
+    # SEPARATE run_test.sh invocation started concurrently (e.g. upstream_tests
+    # and upstream_tests_beta launched side by side) -- race on the same
+    # device enumeration and fail with a hardware "device unavailable" error,
+    # or silently collect 0 tests. The lock path is fixed (no $$) so every
+    # run_test.sh process on the host contends on the same lock file.
+    # Only the actual pytest subprocess is serialized; everything else about
+    # the fan-out (spawn, throttle, retry) is unchanged.
+    local _SPYRE_COLLECT_LOCK="${TMPDIR:-/tmp}/torch_spyre_oot_collect_only.lock"
+    local _HAVE_FLOCK=0
+    command -v flock >/dev/null 2>&1 && _HAVE_FLOCK=1
+    if [[ $_HAVE_FLOCK -eq 0 ]]; then
+        echo "[torch_oot_device_tests_run_parallel] WARNING: flock not found -- collection probes will not be serialized against hardware contention." >&2
+    fi
+
+    # -----------------------------------------------------------------------
     # Step 1: collect all test node IDs across every resolved file.
     #
     # Output of `pytest --collect-only -q` looks like:
@@ -2232,6 +2255,12 @@ _run_parallel_across_cards() {
             _probe_base_cache="${TORCHINDUCTOR_CACHE_DIR:-/tmp/torchinductor_${USER:-$(id -un)}}"
             _probe_slot=$(( i % _n_cards ))
             export TORCHINDUCTOR_CACHE_DIR="${_probe_base_cache}__collect_slot${_probe_slot}"
+            # Serialize only the hardware-touching import (see lock comment above);
+            # queued probes still spawn/throttle exactly as before.
+            if [[ $_HAVE_FLOCK -eq 1 ]]; then
+                exec 9>"$_SPYRE_COLLECT_LOCK"
+                flock 9
+            fi
             cd "$_rd" && python3 -m pytest "$_rb" \
                 "${_collect_args[@]+"${_collect_args[@]}"}" \
                 --collect-only -q --no-header 2>"$_cerr" \
@@ -2332,6 +2361,11 @@ _run_parallel_across_cards() {
                 export OOT_TEST_FILE="$_rf2"
                 # A dedicated cache dir for the retry too, so it can't collide with whatever else is still running.
                 export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/tmp/torchinductor_${USER:-$(id -un)}}__retry_${i}"
+                # Same cross-invocation hardware lock as the primary probe above.
+                if [[ $_HAVE_FLOCK -eq 1 ]]; then
+                    exec 9>"$_SPYRE_COLLECT_LOCK"
+                    flock 9
+                fi
                 cd "$(dirname "$_rf2")" && python3 -m pytest "$(basename "$_rf2")" \
                     "${_collect_args[@]+"${_collect_args[@]}"}" \
                     --collect-only -q --no-header 2>"$_rerr" \
