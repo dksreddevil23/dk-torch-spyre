@@ -2114,8 +2114,11 @@ except Exception as e:
 #
 # Collection uses `pytest --collect-only -q` run from the file's directory
 # so conftest.py and SPYRE_TEST_FILE / OOT_TEST_FILE are set up identically
-# to a real run.  Collection is done without SPYRE_DEVICES so the runtime
-# is not loaded.
+# to a real run.  Collection never sets SPYRE_DEVICES, but concurrently-
+# running probes are each given a distinct LOCAL_RANK (see the semaphore
+# set up at the top of this function) so that any probe whose test file
+# touches the device at import time opens a different physical device
+# instead of racing with the others over device 0.
 #
 # Globals read:   RUN_FILES TEST_FILES _EXTRA_NO_XML _FINAL_XML_PATH
 #                 YAML_CONFIG _XML_INJECT_PY
@@ -2143,27 +2146,28 @@ _run_parallel_across_cards() {
     local _collect_start=$SECONDS
 
     # -----------------------------------------------------------------------
-    # Collection-phase hardware lock.
+    # Collection-phase device-rank semaphore.
     #
-    # instantiate_device_type_tests() (called at module scope by upstream
-    # PyTorch test files) invokes get_all_devices() -> device_mod.device_count()
-    # -> _C.device_count() during IMPORT, i.e. during `--collect-only` -- even
-    # though SPYRE_DEVICES is deliberately left unset for collection below.
-    # That call reaches real hardware. Two such probes running at once --
-    # whether both are this function's own fan-out, or one belongs to a
-    # SEPARATE run_test.sh invocation started concurrently (e.g. upstream_tests
-    # and upstream_tests_beta launched side by side) -- race on the same
-    # device enumeration and fail with a hardware "device unavailable" error,
-    # or silently collect 0 tests. The lock path is fixed (no $$) so every
-    # run_test.sh process on the host contends on the same lock file.
-    # Only the actual pytest subprocess is serialized; everything else about
-    # the fan-out (spawn, throttle, retry) is unchanged.
-    local _SPYRE_COLLECT_LOCK="${TMPDIR:-/tmp}/torch_spyre_oot_collect_only.lock"
-    local _HAVE_FLOCK=0
-    command -v flock >/dev/null 2>&1 && _HAVE_FLOCK=1
-    if [[ $_HAVE_FLOCK -eq 0 ]]; then
-        echo "[torch_oot_device_tests_run_parallel] WARNING: flock not found -- collection probes will not be serialized against hardware contention." >&2
-    fi
+    # Collection never sets SPYRE_DEVICES, but if a test file touches the
+    # device at import/class-definition time, torch_spyre's runtime opens
+    # the physical device at LOCAL_RANK -- which defaults to 0 when unset.
+    # Every concurrently-running collect-only probe below would therefore
+    # default to the SAME physical device and race on it (seen as a VFIO
+    # "device or resource busy" error, or an empty collection for heavier
+    # files). Hand each concurrent probe a distinct rank in 0.._n_cards-1
+    # via a FIFO-backed counting semaphore so they open different physical
+    # devices instead of colliding on device 0. A probe blocks on `read`
+    # until a rank is free, exports it as LOCAL_RANK, and returns it on
+    # exit via a trap.
+    # -----------------------------------------------------------------------
+    local _collect_sem_fifo="/tmp/_spyre_collect_sem_${$}"
+    mkfifo "$_collect_sem_fifo"
+    exec 9<>"$_collect_sem_fifo"
+    rm -f "$_collect_sem_fifo"
+    local _r
+    for (( _r=0; _r<_n_cards; _r++ )); do
+        echo "$_r" >&9
+    done
 
     # -----------------------------------------------------------------------
     # Step 1: collect all test node IDs across every resolved file.
@@ -2240,6 +2244,11 @@ _run_parallel_across_cards() {
         (
             # A 0-match --collect-only (or a killed probe) is expected/handled below, not a script-ending error.
             set +euo pipefail
+            # Acquire this probe's rank from the semaphore set up above and
+            # return it on any exit path (see the function doc comment).
+            IFS= read -r -u 9 _my_rank
+            trap 'echo "$_my_rank" >&9' EXIT
+            export LOCAL_RANK="$_my_rank"
             export SPYRE_TEST_FILE="$_rf"
             export OOT_TEST_FILE="$_rf"
             # Give this probe its own Inductor cache dir so concurrent collect-only imports
@@ -2255,12 +2264,6 @@ _run_parallel_across_cards() {
             _probe_base_cache="${TORCHINDUCTOR_CACHE_DIR:-/tmp/torchinductor_${USER:-$(id -un)}}"
             _probe_slot=$(( i % _n_cards ))
             export TORCHINDUCTOR_CACHE_DIR="${_probe_base_cache}__collect_slot${_probe_slot}"
-            # Serialize only the hardware-touching import (see lock comment above);
-            # queued probes still spawn/throttle exactly as before.
-            if [[ $_HAVE_FLOCK -eq 1 ]]; then
-                exec 9>"$_SPYRE_COLLECT_LOCK"
-                flock 9
-            fi
             cd "$_rd" && python3 -m pytest "$_rb" \
                 "${_collect_args[@]+"${_collect_args[@]}"}" \
                 --collect-only -q --no-header 2>"$_cerr" \
@@ -2357,15 +2360,14 @@ _run_parallel_across_cards() {
             _retry_exit_files[$i]="$_rexit"
             (
                 set +euo pipefail
+                # See the matching rank acquisition in the initial collection fan-out above.
+                IFS= read -r -u 9 _my_rank
+                trap 'echo "$_my_rank" >&9' EXIT
+                export LOCAL_RANK="$_my_rank"
                 export SPYRE_TEST_FILE="$_rf2"
                 export OOT_TEST_FILE="$_rf2"
                 # A dedicated cache dir for the retry too, so it can't collide with whatever else is still running.
                 export TORCHINDUCTOR_CACHE_DIR="${TORCHINDUCTOR_CACHE_DIR:-/tmp/torchinductor_${USER:-$(id -un)}}__retry_${i}"
-                # Same cross-invocation hardware lock as the primary probe above.
-                if [[ $_HAVE_FLOCK -eq 1 ]]; then
-                    exec 9>"$_SPYRE_COLLECT_LOCK"
-                    flock 9
-                fi
                 cd "$(dirname "$_rf2")" && python3 -m pytest "$(basename "$_rf2")" \
                     "${_collect_args[@]+"${_collect_args[@]}"}" \
                     --collect-only -q --no-header 2>"$_rerr" \
@@ -2466,6 +2468,9 @@ _run_parallel_across_cards() {
     local _collect_elapsed=$(( SECONDS - _collect_start ))
     # Report against the actual candidate set rather than every resolved file, now that distributed files are routed elsewhere.
     echo "[torch_oot_device_tests_run_parallel] Collection phase completed in ${_collect_elapsed}s (${#_target_idx[@]} file(s), up to ${_n_cards} concurrent probe(s))."
+
+    # Collection is done -- close the rank semaphore fd set up before Step 1.
+    exec 9<&-
 
     local _total="${#_all_node_ids[@]}"
     if [[ $_total -eq 0 ]]; then
