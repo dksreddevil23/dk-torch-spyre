@@ -73,6 +73,7 @@ from oot_framework.oot_test_utilities import (
     _select_entry_by_op_index,
     _select_entry_for_variant,
     _extract_op_name_from_method,
+    _OOT_PLATFORM_ARCH,
 )
 
 warnings.filterwarnings("ignore", category=pytest.PytestUnknownMarkWarning)
@@ -152,6 +153,13 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
     # Drives the testtype__<label> pytest markers (see _OOTTestTypeMarkerPatcher).
     TEST_SUITE_LABELS: List[str] = []
 
+    # test_suite_config.exclude_platforms from the YAML, lower-cased, e.g.
+    # ["ppc64le"]. When this machine's arch (_OOT_PLATFORM_ARCH) is in this
+    # list, _should_run() drops every test in this file -- mirrors
+    # filter_configs.py's own exclude_platforms gate, but evaluated on the
+    # actual test-execution machine, not only at CI matrix-selection time.
+    TEST_SUITE_EXCLUDED_PLATFORMS: List[str] = []
+
     # File-level module filtering (populated during config load)
     # Use None as sentinel to indicate not yet initialized, avoiding shared mutable default
     _FILE_LEVEL_INCLUDED_MODULES: Optional[Set[str]] = None
@@ -230,6 +238,18 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
         cls.TEST_SUITE_LABELS = list(
             file_entry.labels or config.test_suite_config.labels
         )
+
+        # Mirrors TEST_SUITE_LABELS above: file_entry wins when a
+        # multi-config merge threaded it on, else fall back to the
+        # single-config top-level field. Lower-cased to match
+        # filter_configs.py's own case-insensitive convention.
+        cls.TEST_SUITE_EXCLUDED_PLATFORMS = [
+            str(p).lower()
+            for p in (
+                file_entry.exclude_platforms
+                or config.test_suite_config.exclude_platforms
+            )
+        ]
 
         # Build the exact-name lookup map and the regex-pattern list.
         # Regex patterns (names containing regex metacharacters) go into
@@ -415,6 +435,20 @@ class OOTTestBase(PrivateUse1TestBase):  # type: ignore[name-defined]  # noqa: F
 
         Returns (enabled: bool, reason: Optional[str], xfail: bool, strict: bool)
         """
+        # Suite-wide platform exclusion -- checked first since it is
+        # independent of the resolved TestEntry and should short-circuit
+        # everything else. Case-insensitive, matching filter_configs.py's
+        # own exclude_platforms convention (TEST_SUITE_EXCLUDED_PLATFORMS is
+        # already lower-cased in _load_test_suite_config).
+        if _OOT_PLATFORM_ARCH.lower() in cls.TEST_SUITE_EXCLUDED_PLATFORMS:
+            return (
+                False,
+                f"Excluded on platform {_OOT_PLATFORM_ARCH!r} "
+                "(test_suite_config.exclude_platforms)",
+                False,
+                False,
+            )
+
         # If entry was not pre-resolved by the caller, fall back to the old
         # single-entry lookup for backward compatibility.
         if entry is None:
