@@ -136,19 +136,20 @@ def _display_name(config_path: Path, config_dir: Path) -> str:
     return _title(parts[-1])
 
 
-def _load_labels(path: Path) -> list:
-    """Read test_suite_config.labels from a YAML config; no labels means no match."""
+def _load_tsc(path: Path) -> dict:
+    """Read test_suite_config from a YAML config file; absent/empty means {}."""
     with path.open() as fh:
         raw = yaml.safe_load(fh) or {}
-    tsc = raw.get("test_suite_config") or {}
+    return raw.get("test_suite_config") or {}
+
+
+def _load_labels(tsc: dict) -> list:
+    """Extract labels from an already-parsed test_suite_config dict."""
     return list(tsc.get("labels") or [])
 
 
-def _load_excluded_platforms(path: Path) -> list:
-    """Read test_suite_config.exclude_platforms from a config; absent means none."""
-    with path.open() as fh:
-        raw = yaml.safe_load(fh) or {}
-    tsc = raw.get("test_suite_config") or {}
+def _load_excluded_platforms(tsc: dict) -> list:
+    """Extract exclude_platforms from an already-parsed test_suite_config dict."""
     return [str(p).lower() for p in (tsc.get("exclude_platforms") or [])]
 
 
@@ -310,8 +311,9 @@ def main() -> None:
     skipped_platform = 0
     for cfg in sorted(config_dir.rglob("*.yaml")):
         try:
-            labels = _load_labels(cfg)
-            excluded_platforms = _load_excluded_platforms(cfg)
+            tsc = _load_tsc(cfg)
+            labels = _load_labels(tsc)
+            excluded_platforms = _load_excluded_platforms(tsc)
         except Exception as exc:  # noqa: BLE001
             print(f"WARNING: skipping {cfg} ({exc})", file=sys.stderr)
             continue

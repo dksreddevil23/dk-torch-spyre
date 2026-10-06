@@ -1570,6 +1570,9 @@ class FileEntry(BaseModel):
     # OOTTestBase._load_test_suite_config(), which prefers this over
     # test_suite_config.labels when non-empty.
     labels: List[str] = []
+    # Not a real YAML field either -- same merge-provenance mirroring as
+    # labels above, for test_suite_config.exclude_platforms.
+    exclude_platforms: List[str] = []
     tests: List[TestEntry] = []
 
     @field_validator("unlisted_test_mode")
@@ -1782,6 +1785,7 @@ class TestsBlock(BaseModel):
     files: List[FileEntry]
     global_config: GlobalConfig = GlobalConfig()
     labels: List[str] = []
+    exclude_platforms: List[str] = []
 
     @model_validator(mode="before")
     @classmethod
