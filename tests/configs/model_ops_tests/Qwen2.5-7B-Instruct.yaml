@@ -1,5 +1,5 @@
 test_suite_config:
-  labels: [trunk]  
+  labels: [trunk]
   exclude_platforms: [ppc64le]
   global:
     supported_dtypes:
