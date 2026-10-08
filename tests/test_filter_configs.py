@@ -18,6 +18,7 @@ import importlib.util
 import platform
 from pathlib import Path
 
+import pytest
 import yaml
 
 HELPER = (
@@ -47,23 +48,18 @@ def test_load_tsc_dedup(tmp_path):
     assert filter_configs._load_excluded_platforms(tsc) == ["ppc64le"]
 
 
-def test_excluded_on_matching_platform(tmp_path, monkeypatch):
-    monkeypatch.setattr(platform, "machine", lambda: "ppc64le")
-    path = _write_config(tmp_path, exclude_platforms=["ppc64le"])
+@pytest.mark.parametrize(
+    "exclude_platforms,machine,expected",
+    [
+        (["ppc64le"], "ppc64le", True),  # dropped: current arch is excluded
+        (["ppc64le"], "x86_64", False),  # kept: current arch isn't excluded
+        (None, "ppc64le", False),  # kept: no exclude_platforms set at all
+    ],
+)
+def test_excluded_on_this_platform(
+    tmp_path, monkeypatch, exclude_platforms, machine, expected
+):
+    monkeypatch.setattr(platform, "machine", lambda: machine)
+    path = _write_config(tmp_path, exclude_platforms=exclude_platforms)
     excluded = filter_configs._load_excluded_platforms(filter_configs._load_tsc(path))
-    assert filter_configs._excluded_on_this_platform(excluded) is True
-
-
-def test_kept_on_non_matching_platform(tmp_path, monkeypatch):
-    monkeypatch.setattr(platform, "machine", lambda: "x86_64")
-    path = _write_config(tmp_path, exclude_platforms=["ppc64le"])
-    excluded = filter_configs._load_excluded_platforms(filter_configs._load_tsc(path))
-    assert filter_configs._excluded_on_this_platform(excluded) is False
-
-
-def test_no_exclude_platforms_means_never_excluded(tmp_path, monkeypatch):
-    monkeypatch.setattr(platform, "machine", lambda: "ppc64le")
-    path = _write_config(tmp_path, labels=["trunk"])
-    excluded = filter_configs._load_excluded_platforms(filter_configs._load_tsc(path))
-    assert excluded == []
-    assert filter_configs._excluded_on_this_platform(excluded) is False
+    assert filter_configs._excluded_on_this_platform(excluded) is expected
