@@ -16,25 +16,27 @@
 
 from pathlib import Path
 
+import pytest
+
 from oot_checker.checks import KNOWN_PLATFORMS, check_invalid_platforms
 
 
-def test_known_value_passes():
-    assert check_invalid_platforms({Path("a.yaml"): ["ppc64le"]}) == 0
-
-
-def test_typo_is_flagged():
-    assert check_invalid_platforms({Path("a.yaml"): ["ppc64"]}) == 1
-    assert check_invalid_platforms({Path("a.yaml"): ["power"]}) == 1
-
-
-def test_empty_list_passes():
-    assert check_invalid_platforms({Path("a.yaml"): []}) == 0
-
-
-def test_case_insensitive():
-    assert check_invalid_platforms({Path("a.yaml"): ["PPC64LE"]}) == 0
+@pytest.mark.parametrize(
+    "platforms,expected",
+    [
+        (["ppc64le"], 0),  # known value
+        ([], 0),  # nothing declared
+        (["PPC64LE"], 0),  # known value, mixed case
+        (["ppc64"], 1),  # typo
+        (["power"], 1),  # typo
+    ],
+)
+def test_check_invalid_platforms(platforms, expected):
+    assert check_invalid_platforms({Path("a.yaml"): platforms}) == expected
 
 
 def test_known_platforms_contains_expected_values():
+    # Pinned exactly: a silent edit here (e.g. dropping "s390x") would make
+    # check_invalid_platforms stop flagging a real typo for that arch, and
+    # the parametrized cases above wouldn't catch it since none exercise it.
     assert KNOWN_PLATFORMS == {"x86_64", "ppc64le", "s390x", "aarch64"}

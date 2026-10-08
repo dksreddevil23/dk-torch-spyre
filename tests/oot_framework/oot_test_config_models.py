@@ -1568,8 +1568,7 @@ class FileEntry(BaseModel):
     # OOTTestBase._load_test_suite_config(), which prefers this over
     # test_suite_config.labels when non-empty.
     labels: List[str] = []
-    # Not a real YAML field either -- same merge-provenance mirroring as
-    # labels above, for test_suite_config.exclude_platforms.
+    # Merge-provenance only, like labels above, for exclude_platforms.
     exclude_platforms: List[str] = []
     tests: List[TestEntry] = []
 
