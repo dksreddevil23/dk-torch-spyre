@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""oot_checker.checks.check_invalid_platforms: typo'd exclude_platforms values."""
+"""oot_checker.checks.check_invalid_platforms: typo'd exclude__plat_* tag suffixes."""
 
 from pathlib import Path
 

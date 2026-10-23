@@ -75,17 +75,18 @@ def check_missing_labels(labels_by_file: dict[Path, list | None]) -> int:
 # ---------------------------
 
 # Values platform.machine() is known to return across this project's CI/Jenkins
-# fleet. Keep in sync with filter_configs.py's module docstring.
+# fleet. Keep in sync with the exclude__plat_* tag convention in
+# oot_test_base_common.py's OOTTestBase._should_run().
 KNOWN_PLATFORMS = {"x86_64", "ppc64le", "s390x", "aarch64"}
 
 
 def check_invalid_platforms(excluded_by_file: dict[Path, list]) -> int:
     """
-    Verify every test_suite_config.exclude_platforms value is a platform.machine()
-    string this project actually runs on.
+    Verify every exclude__plat_* tag suffix is a platform.machine() string this
+    project actually runs on.
 
     A typo'd value (e.g. "ppc64" or "power" instead of "ppc64le") silently never
-    matches platform.machine() -- the config quietly keeps running on the very
+    matches platform.machine() -- the entry quietly keeps running on the very
     architecture it meant to exclude. That's a correctness bug, not a style nit,
     so it's a hard error here, same severity as check_missing_labels.
 
@@ -108,13 +109,13 @@ def check_invalid_platforms(excluded_by_file: dict[Path, list]) -> int:
             bad[path] = unknown
 
     if not bad:
-        print(green("  [platforms] All exclude_platforms values recognized.\n"))
+        print(green("  [platforms] All exclude__plat_* tag suffixes recognized.\n"))
         return 0
 
     print(
         red(
             f"  [platforms] {len(bad)} config file(s) with an unrecognized "
-            f"exclude_platforms value:\n"
+            f"exclude__plat_* tag suffix:\n"
         )
     )
     for path in sorted(bad, key=str):

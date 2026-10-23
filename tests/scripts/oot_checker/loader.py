@@ -79,7 +79,11 @@ def load_labels(config_files: list[Path]) -> dict[Path, list | None]:
 
 def load_excluded_platforms(config_files: list[Path]) -> dict[Path, list]:
     """
-    Read test_suite_config.exclude_platforms from each config file.
+    Read exclude__plat_<arch> tag suffixes from each config file's test entries.
+
+    Platform exclusion is declared per test entry (a tag like
+    "exclude__plat_ppc64le" in that entry's `tags:` list), not per file or
+    suite, so a merged multi-config run only ever excludes the tagged entry.
 
     Parameters
     ----------
@@ -89,8 +93,8 @@ def load_excluded_platforms(config_files: list[Path]) -> dict[Path, list]:
     Returns
     -------
     dict[Path, list]
-        Maps each config file to its declared exclude_platforms list
-        (empty list when absent).
+        Maps each config file to the list of platform suffixes named by its
+        entries' exclude__plat_* tags (empty list when none are present).
     """
     result: dict[Path, list] = {}
     for cf in config_files:
@@ -99,8 +103,13 @@ def load_excluded_platforms(config_files: list[Path]) -> dict[Path, list]:
         except Exception as e:
             _warn(f"Cannot load {cf}: {e}")
             continue
-        tsc = cfg.get("test_suite_config") or {}
-        result[cf] = list(tsc.get("exclude_platforms") or [])
+        suffixes = []
+        for file_entry in cfg.get("test_suite_config", {}).get("files", []):
+            for block in file_entry.get("tests", []):
+                for tag in block.get("tags", []):
+                    if tag.startswith("exclude__plat_"):
+                        suffixes.append(tag[len("exclude__plat_") :])
+        result[cf] = suffixes
     return result
 
 
